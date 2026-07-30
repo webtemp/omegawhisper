@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { Settings, X, Download, Loader2, Trash2, Zap, Target, ChevronDown, ChevronUp } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -46,6 +47,10 @@ interface ModelDownloadProgress {
 interface Settings {
   active_local_model_id: string | null;
   selected_microphone: string | null;
+  pause_shortening: boolean;
+  pause_cutoff_ms: number;
+  pause_protect_opening: boolean;
+  pause_opening_ms: number;
 }
 
 export function SettingsPage() {
@@ -71,6 +76,13 @@ export function SettingsPage() {
 
   // The debug line. Read on its own below because the tray menu sets it too.
   const [showDebugStats, setShowDebugStats] = useState(false);
+
+  // Shorten long pauses before the model reads the recording. The two lengths
+  // are kept as text while being typed, so a half-typed number is not saved.
+  const [pauseShortening, setPauseShortening] = useState(false);
+  const [pauseCutoffMs, setPauseCutoffMs] = useState("2200");
+  const [pauseProtectOpening, setPauseProtectOpening] = useState(true);
+  const [pauseOpeningMs, setPauseOpeningMs] = useState("3000");
 
   // The dictation key. Rust owns it: it has to be registered at startup, long
   // before this window exists.
@@ -99,6 +111,10 @@ export function SettingsPage() {
         const saved = await invoke<Settings>("get_settings");
         setActiveModelId(saved.active_local_model_id);
         setMicrophone(saved.selected_microphone);
+        setPauseShortening(saved.pause_shortening);
+        setPauseCutoffMs(String(saved.pause_cutoff_ms));
+        setPauseProtectOpening(saved.pause_protect_opening);
+        setPauseOpeningMs(String(saved.pause_opening_ms));
       } catch (err) {
         console.error("Could not read the saved settings:", err);
       }
@@ -309,6 +325,27 @@ export function SettingsPage() {
     } catch (err) {
       console.error("Failed to select model:", err);
       setModelError(String(err));
+    }
+  };
+
+  // Save a millisecond box once it is finished with. Rust clamps the number
+  // and hands back what it stored, so the box always shows what is really set;
+  // anything that is not a number falls back to the default.
+  const saveMilliseconds = async (
+    command: string,
+    typed: string,
+    fallback: number,
+    show: (value: string) => void
+  ) => {
+    const wanted = Number.parseInt(typed, 10);
+    try {
+      const stored = await invoke<number>(command, {
+        milliseconds: Number.isFinite(wanted) ? wanted : fallback,
+      });
+      show(String(stored));
+    } catch (err) {
+      console.error(`${command} failed:`, err);
+      show(String(fallback));
     }
   };
 
@@ -573,6 +610,126 @@ export function SettingsPage() {
             <p className="text-xs text-white/30">
               Works offline. Whisper models support all languages; Parakeet is English only.
             </p>
+          </div>
+
+          {/* Pause-shortening. Experimental, so it stays off unless it is
+              asked for, and every number behind it can be changed here. */}
+          <div className="space-y-2">
+            <Label className="text-xs uppercase tracking-wide text-white/50">
+              Pause-shortening
+            </Label>
+
+            <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
+              <div className="pr-3">
+                <span className="text-sm text-white">Shorten long pauses</span>
+                <p className="text-xs text-white/40">
+                  Cuts a long pause in the middle down to about 0.3 seconds
+                  before the model reads the recording. The gap always stays, so
+                  the full stop it puts there stays too.
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  const next = !pauseShortening;
+                  setPauseShortening(next);
+                  invoke("set_pause_shortening", { enabled: next }).catch(() => {});
+                }}
+                className={`shrink-0 w-10 h-5 rounded-full transition-colors ${
+                  pauseShortening ? "bg-green-500" : "bg-white/20"
+                }`}
+              >
+                <div
+                  className={`w-4 h-4 rounded-full bg-white transition-transform ${
+                    pauseShortening ? "translate-x-5" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+
+            {/* The rest only matter once it is on, so they are dimmed and
+                switched off until then. */}
+            <div className={pauseShortening ? "space-y-2" : "space-y-2 opacity-40"}>
+              <div className="flex items-center justify-between gap-3 p-3 bg-white/5 rounded-lg">
+                <div>
+                  <span className="text-sm text-white">Cutoff time</span>
+                  <p className="text-xs text-white/40">
+                    A pause has to last this long before any of it is removed.
+                    Below about 2000 it starts cutting the breaths between
+                    sentences, which is where the full stops come from.
+                  </p>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <Input
+                    type="number"
+                    min={500}
+                    max={30000}
+                    step={100}
+                    disabled={!pauseShortening}
+                    value={pauseCutoffMs}
+                    onChange={(e) => setPauseCutoffMs(e.target.value)}
+                    onBlur={() => saveMilliseconds(
+                      "set_pause_cutoff_ms", pauseCutoffMs, 2200, setPauseCutoffMs
+                    )}
+                    className="w-20 h-8 bg-white/10 border-0 text-white text-sm text-right"
+                  />
+                  <span className="text-xs text-white/40">ms</span>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
+                <div className="pr-3">
+                  <span className="text-sm text-white">Protect the start</span>
+                  <p className="text-xs text-white/40">
+                    Never cut near the first words. The model reads the language
+                    and the writing style from them, and the rest of the text
+                    follows that.
+                  </p>
+                </div>
+                <button
+                  disabled={!pauseShortening}
+                  onClick={() => {
+                    const next = !pauseProtectOpening;
+                    setPauseProtectOpening(next);
+                    invoke("set_pause_protect_opening", { enabled: next }).catch(() => {});
+                  }}
+                  className={`shrink-0 w-10 h-5 rounded-full transition-colors ${
+                    pauseProtectOpening ? "bg-green-500" : "bg-white/20"
+                  }`}
+                >
+                  <div
+                    className={`w-4 h-4 rounded-full bg-white transition-transform ${
+                      pauseProtectOpening ? "translate-x-5" : "translate-x-0.5"
+                    }`}
+                  />
+                </button>
+              </div>
+
+              <div className="flex items-center justify-between gap-3 p-3 bg-white/5 rounded-lg">
+                <div>
+                  <span className="text-sm text-white">How much of the start</span>
+                  <p className="text-xs text-white/40">
+                    Counted from the first word spoken, not from the moment
+                    recording began, so a slow start does not use it up.
+                  </p>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <Input
+                    type="number"
+                    min={0}
+                    max={30000}
+                    step={500}
+                    disabled={!pauseShortening || !pauseProtectOpening}
+                    value={pauseOpeningMs}
+                    onChange={(e) => setPauseOpeningMs(e.target.value)}
+                    onBlur={() => saveMilliseconds(
+                      "set_pause_opening_ms", pauseOpeningMs, 3000, setPauseOpeningMs
+                    )}
+                    className="w-20 h-8 bg-white/10 border-0 text-white text-sm text-right"
+                  />
+                  <span className="text-xs text-white/40">ms</span>
+                </div>
+              </div>
+            </div>
           </div>
 
           {/* Diagnostics. Its own section: it has nothing to do with which

@@ -257,6 +257,132 @@ pub(crate) fn trim_quiet_edges(samples: &mut Vec<f32>) -> f32 {
     cut_seconds
 }
 
+// How much of a shortened pause is left behind. Whisper decides where a
+// sentence ends from the pauses it hears, so the gap has to survive - only
+// its length changes.
+const KEEP_PAUSE_FRAMES: usize = 10; // ~0.3 s, split evenly across the join
+
+// Samples blended across the join. A hard cut leaves a step in the wave, which
+// is heard as a click and is exactly the kind of thing that confuses the model.
+const JOIN_FADE: usize = 80; // 5 ms at 16 kHz
+
+// What Settings says pause-shortening should do.
+#[derive(Clone, Copy)]
+pub(crate) struct PauseRules {
+    // A pause has to last at least this long before any of it is removed.
+    //
+    // Worth keeping high. Over 32 real recordings a 1 s limit shortened 14 of
+    // them and saved 8%; 2.2 s shortens 3 and saves 4%. The 11 extra were all
+    // ordinary breathing between sentences, which is what Whisper uses to
+    // decide where the full stops go.
+    pub(crate) cutoff_ms: u32,
+    // Leave this long after the first spoken word alone, or None to allow
+    // cutting anywhere. Whisper reads the recording as one block and settles
+    // on a language and a writing style from the first words it hears, and
+    // the rest of the text follows that decision.
+    pub(crate) protect_opening_ms: Option<u32>,
+}
+
+// Where the long pauses are, as (first quiet frame, first loud frame after it).
+//
+// Only stretches with speech on both sides count, so the quiet head and tail
+// are never in here - those belong to trim_quiet_edges.
+pub(crate) fn long_pauses(samples: &[f32], rules: PauseRules) -> Vec<(usize, usize)> {
+    const FRAME: usize = 480; // 30 ms at 16 kHz
+
+    // Never shorter than what is kept: below that the two halves of a pause
+    // would overlap and the copying further down would read past its end.
+    let min_pause_frames = (rules.cutoff_ms as usize / 30).max(KEEP_PAUSE_FRAMES + 1);
+
+    let level = speech_level(samples);
+    if level <= 0.0 {
+        return Vec::new();
+    }
+    // The same bar trim_quiet_edges uses: a quarter of how loudly this person
+    // spoke, so it works on any microphone in any room.
+    let threshold = (level * 0.25).max(0.004);
+
+    let loud: Vec<bool> = samples
+        .chunks(FRAME)
+        .map(|c| {
+            let sum: f32 = c.iter().map(|s| s * s).sum();
+            (sum / c.len() as f32).sqrt() > threshold
+        })
+        .collect();
+
+    let Some(first) = loud.iter().position(|&x| x) else {
+        return Vec::new();
+    };
+    let last = loud.iter().rposition(|&x| x).unwrap_or(first);
+
+    // The opening is counted from the first spoken word, not from the start of
+    // the file, so a long walk to the microphone does not use it up.
+    let opening_ends = match rules.protect_opening_ms {
+        Some(ms) => first + ms as usize / 30,
+        None => 0,
+    };
+
+    let mut pauses: Vec<(usize, usize)> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for (frame, &is_loud) in loud.iter().enumerate().take(last + 1).skip(first) {
+        if is_loud {
+            if let Some(start) = run_start.take() {
+                if frame - start >= min_pause_frames && start >= opening_ends {
+                    pauses.push((start, frame));
+                }
+            }
+        } else if run_start.is_none() {
+            run_start = Some(frame);
+        }
+    }
+    pauses
+}
+
+// Shorten the long pauses in the middle of a recording, without removing them.
+//
+// Thinking for three seconds mid-sentence means three seconds the model has to
+// read through. This keeps about 0.3 s of that pause - enough for Whisper to
+// still hear a sentence break - and drops the rest.
+//
+// Runs over the finished recording, never a live stream, so every frame is a
+// full frame and the speaking level is already known. The old voice detection
+// worked the other way and padded half-frames with zeros, which turned one
+// second of speech into three.
+//
+// Returns how many seconds were removed.
+pub(crate) fn shorten_long_pauses(samples: &mut Vec<f32>, rules: PauseRules) -> f32 {
+    const FRAME: usize = 480; // 30 ms at 16 kHz
+    const HALF_KEEP: usize = KEEP_PAUSE_FRAMES / 2;
+
+    let pauses = long_pauses(samples, rules);
+    if pauses.is_empty() {
+        return 0.0;
+    }
+
+    let mut out: Vec<f32> = Vec::with_capacity(samples.len());
+    let mut copied = 0usize;
+    for (start, end) in pauses {
+        let head_end = (start + HALF_KEEP) * FRAME;
+        let tail_start = (end - HALF_KEEP) * FRAME;
+        out.extend_from_slice(&samples[copied..head_end]);
+
+        // Fade one side into the other across the join. Both sides are room
+        // noise from this same recording, so the result stays room noise.
+        let joined = out.len();
+        for i in 0..JOIN_FADE {
+            let mix = (i + 1) as f32 / (JOIN_FADE + 1) as f32;
+            let from = out[joined - JOIN_FADE + i];
+            out[joined - JOIN_FADE + i] = from * (1.0 - mix) + samples[tail_start + i] * mix;
+        }
+        copied = tail_start + JOIN_FADE;
+    }
+    out.extend_from_slice(&samples[copied..]);
+
+    let removed = (samples.len() - out.len()) as f32 / 16_000.0;
+    *samples = out;
+    removed
+}
+
 // Bring quiet recordings up to a level the model can work with.
 //
 // Whisper reads audio in 30 second windows and drops a whole window when it
