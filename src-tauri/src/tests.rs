@@ -355,6 +355,272 @@ fn a_quiet_tail_is_cut_without_touching_the_front() {
     assert_eq!(audio.len(), 26_880, "the tail was cut");
 }
 
+// ---- shortening the long pauses in the middle -------------------------
+
+// The biggest step between two neighbouring samples. A big step is a click.
+fn biggest_step(samples: &[f32]) -> f32 {
+    samples
+        .windows(2)
+        .fold(0.0f32, |max, w| max.max((w[1] - w[0]).abs()))
+}
+
+// 5 s of speech, so the pause that follows is past the protected opening.
+// Anything shorter than this is left alone whatever else it is.
+const PAST_THE_OPENING: usize = 170;
+
+// What Settings starts out saying: 2.2 s, first 5 s protected.
+fn rules() -> PauseRules {
+    PauseRules {
+        cutoff_ms: default_pause_cutoff_ms(),
+        protect_opening_ms: Some(default_pause_opening_ms()),
+    }
+}
+
+#[test]
+fn a_long_pause_is_shortened_to_about_a_third_of_a_second() {
+    // 5.1 s of speech, 3 s of thinking, 0.6 s of speech.
+    let mut audio = blocks(&[(PAST_THE_OPENING, 0.1), (100, 0.0), (20, 0.1)]);
+    let speech_samples_before = audio.iter().filter(|s| s.abs() > 0.05).count();
+    let opening: Vec<f32> = audio[..PAST_THE_OPENING * 480].to_vec();
+    let last_block: Vec<f32> = audio[audio.len() - 20 * 480..].to_vec();
+
+    let removed = shorten_long_pauses(&mut audio, rules());
+
+    near(removed, 2.705, 0.001, "seconds removed");
+    let quiet = audio.iter().filter(|s| s.abs() < 0.05).count();
+    near(
+        quiet as f32 / 16_000.0,
+        0.295,
+        0.001,
+        "what is left of the pause",
+    );
+    assert_eq!(
+        audio.iter().filter(|s| s.abs() > 0.05).count(),
+        speech_samples_before,
+        "every spoken sample survived"
+    );
+    assert_eq!(
+        audio[..PAST_THE_OPENING * 480],
+        opening[..],
+        "the speech before the cut"
+    );
+    assert_eq!(
+        audio[audio.len() - 20 * 480..],
+        last_block[..],
+        "the speech after the cut"
+    );
+}
+
+#[test]
+fn two_long_pauses_are_both_shortened() {
+    let mut audio = blocks(&[
+        (PAST_THE_OPENING, 0.1),
+        (100, 0.0),
+        (20, 0.1),
+        (100, 0.0),
+        (20, 0.1),
+    ]);
+    let removed = shorten_long_pauses(&mut audio, rules());
+    near(removed, 5.41, 0.001, "2.705 s taken out of each pause");
+    assert_eq!(audio.len(), 110_240);
+}
+
+#[test]
+fn a_recording_without_a_long_pause_comes_back_untouched() {
+    // (recording, why)
+    let cases: &[(Vec<f32>, &str)] = &[
+        (blocks(&[(40, 0.1)]), "speech with no pause in it at all"),
+        (
+            blocks(&[(PAST_THE_OPENING, 0.1), (20, 0.0), (20, 0.1)]),
+            "a 0.6 s pause: normal breathing, left alone",
+        ),
+        (
+            blocks(&[(PAST_THE_OPENING, 0.1), (50, 0.0), (20, 0.1)]),
+            "1.5 s: still a breath between sentences, and Whisper needs it",
+        ),
+        (
+            blocks(&[(PAST_THE_OPENING, 0.1), (72, 0.0), (20, 0.1)]),
+            "2.16 s, one frame under the 2.2 s the settings start at",
+        ),
+        (
+            blocks(&[(100, 0.0), (20, 0.1), (100, 0.0)]),
+            "a quiet start and end belong to trim_quiet_edges, not here",
+        ),
+    ];
+    for (recording, what) in cases {
+        let mut audio = recording.clone();
+        near(shorten_long_pauses(&mut audio, rules()), 0.0, 0.0001, what);
+        assert_eq!(&audio, recording, "{what}: not one sample may change");
+    }
+}
+
+// The first seconds decide the language and the writing style for the whole
+// recording, so nothing is cut near them.
+#[test]
+fn a_pause_in_the_opening_seconds_is_left_alone() {
+    // (recording, why)
+    let cases: &[(Vec<f32>, &str)] = &[
+        (
+            blocks(&[(20, 0.1), (100, 0.0), (20, 0.1)]),
+            "a 3 s pause 0.6 s in: too close to the first words",
+        ),
+        (
+            blocks(&[(99, 0.1), (100, 0.0), (20, 0.1)]),
+            "one frame short of the opening being over",
+        ),
+        (
+            blocks(&[(100, 0.0), (20, 0.1), (100, 0.0), (20, 0.1)]),
+            "the opening is counted from the first word, not from the file",
+        ),
+    ];
+    for (recording, what) in cases {
+        let mut audio = recording.clone();
+        near(shorten_long_pauses(&mut audio, rules()), 0.0, 0.0001, what);
+        assert_eq!(&audio, recording, "{what}: not one sample may change");
+    }
+
+    // One frame later and it is shortened, so the line is where it says it is.
+    let mut audio = blocks(&[(100, 0.1), (100, 0.0), (20, 0.1)]);
+    assert!(
+        shorten_long_pauses(&mut audio, rules()) > 0.0,
+        "a pause starting just after the opening is shortened"
+    );
+}
+
+#[test]
+fn switching_the_opening_off_lets_an_early_pause_be_shortened() {
+    let early = blocks(&[(20, 0.1), (100, 0.0), (20, 0.1)]);
+
+    let mut protected = early.clone();
+    near(
+        shorten_long_pauses(&mut protected, rules()),
+        0.0,
+        0.0001,
+        "protected: left alone",
+    );
+
+    let mut unprotected = early;
+    near(
+        shorten_long_pauses(
+            &mut unprotected,
+            PauseRules {
+                protect_opening_ms: None,
+                ..rules()
+            },
+        ),
+        2.705,
+        0.001,
+        "unprotected: the same pause is shortened",
+    );
+}
+
+#[test]
+fn the_opening_length_decides_how_much_is_protected() {
+    // Speech for 3 s, then a 3 s pause. (protected opening, is it shortened)
+    let cases: &[(u32, bool, &str)] = &[
+        (5000, false, "a 5 s opening covers a pause 3 s in"),
+        (3000, true, "exactly on the line"),
+        (1000, true, "a 1 s opening does not reach it"),
+        (0, true, "no opening at all"),
+    ];
+    for &(opening_ms, expected, what) in cases {
+        let mut audio = blocks(&[(100, 0.1), (100, 0.0), (20, 0.1)]);
+        let removed = shorten_long_pauses(
+            &mut audio,
+            PauseRules {
+                protect_opening_ms: Some(opening_ms),
+                ..rules()
+            },
+        );
+        assert_eq!(removed > 0.0, expected, "{what}");
+    }
+}
+
+#[test]
+fn the_cutoff_decides_which_pauses_are_touched() {
+    // A 2 s pause. (cutoff in milliseconds, is it shortened, why)
+    let cases: &[(u32, bool, &str)] = &[
+        (2200, false, "the default leaves a 2 s pause alone"),
+        (2000, true, "exactly on the cutoff"),
+        (1000, true, "a low cutoff reaches it"),
+        (30_000, false, "a cutoff longer than any real pause"),
+    ];
+    for &(cutoff_ms, expected, what) in cases {
+        let mut audio = blocks(&[(PAST_THE_OPENING, 0.1), (67, 0.0), (20, 0.1)]);
+        let removed = shorten_long_pauses(
+            &mut audio,
+            PauseRules {
+                cutoff_ms,
+                ..rules()
+            },
+        );
+        assert_eq!(removed > 0.0, expected, "{what}");
+    }
+}
+
+// A settings file edited by hand can hold anything, and this runs on the
+// transcription thread where a panic loses the whole dictation.
+#[test]
+fn a_nonsense_cutoff_does_not_panic() {
+    for cutoff_ms in [0, 1, 299, 300, u32::MAX] {
+        let mut audio = blocks(&[(PAST_THE_OPENING, 0.1), (100, 0.0), (20, 0.1)]);
+        let length_before = audio.len();
+        let removed = shorten_long_pauses(
+            &mut audio,
+            PauseRules {
+                cutoff_ms,
+                ..rules()
+            },
+        );
+        assert!(
+            audio.len() + (removed * 16_000.0) as usize == length_before,
+            "cutoff {cutoff_ms}: the length and the seconds reported must agree"
+        );
+    }
+}
+
+#[test]
+fn a_recording_with_nothing_in_it_does_not_panic() {
+    let cases: &[(Vec<f32>, &str)] = &[
+        (Vec::new(), "nothing recorded"),
+        (vec![0.5; 100], "shorter than one 30 ms block"),
+        (blocks(&[(50, 0.0)]), "digital silence"),
+        (blocks(&[(50, 0.002)]), "an empty room"),
+    ];
+    for (recording, what) in cases {
+        let mut audio = recording.clone();
+        near(shorten_long_pauses(&mut audio, rules()), 0.0, 0.0001, what);
+        assert_eq!(&audio, recording, "{what}: nothing should change");
+    }
+}
+
+#[test]
+fn the_join_does_not_leave_a_click() {
+    // A steady 55 Hz hum stands in for room noise. Cutting it at two different
+    // points in its wave is exactly how a click gets made.
+    let mut audio = blocks(&[(PAST_THE_OPENING, 0.1)]);
+    audio.extend(sine(100 * 480, 55.0, 16_000.0, 0.005));
+    audio.extend(blocks(&[(20, 0.1)]));
+
+    // What a straight cut would have jumped by, with nothing blended.
+    let hard_cut = (audio[265 * 480] - audio[175 * 480 - 1]).abs();
+    assert!(
+        hard_cut > 0.002,
+        "this test is only meaningful if a straight cut would jump: {hard_cut}"
+    );
+
+    shorten_long_pauses(&mut audio, rules());
+
+    // The speech blocks jump by 0.2 every sample by design, so only the quiet
+    // middle is measured.
+    let middle = &audio[PAST_THE_OPENING * 480..audio.len() - 20 * 480];
+    let step = biggest_step(middle);
+    assert!(
+        step < hard_cut / 10.0,
+        "the join jumps by {step}, a straight cut would jump by {hard_cut}"
+    );
+}
+
 // ---- the numbers shown while recording --------------------------------
 
 #[test]
@@ -693,6 +959,24 @@ fn a_settings_file_from_before_the_move_keeps_its_defaults() {
     assert_eq!(prefs.shortcut, "Alt+Space");
     assert!(prefs.active_local_model_id.is_none());
     assert!(
+        !prefs.pause_shortening,
+        "pause-shortening is off unless it has been switched on"
+    );
+    // A file written before these existed must not read as "cut everything,
+    // and cut it at the start too".
+    assert_eq!(
+        prefs.pause_cutoff_ms, 2200,
+        "the cutoff falls back to 2.2 s"
+    );
+    assert!(
+        prefs.pause_protect_opening,
+        "and the opening is protected until that is switched off"
+    );
+    assert_eq!(
+        prefs.pause_opening_ms, 3000,
+        "the opening falls back to 3 s"
+    );
+    assert!(
         !prefs.migrated_from_browser,
         "the browser settings have not been copied over yet"
     );
@@ -705,12 +989,23 @@ fn every_setting_survives_being_written_and_read_back() {
         shortcut: "CommandOrControl+Shift+D".to_string(),
         active_local_model_id: Some("whisper-small".to_string()),
         selected_microphone: Some("MacBook Pro Microphone".to_string()),
+        pause_shortening: true,
+        pause_cutoff_ms: 3500,
+        pause_protect_opening: false,
+        pause_opening_ms: 8000,
         migrated_from_browser: true,
     };
     let text = serde_json::to_string(&saved).unwrap();
     let loaded: Prefs = serde_json::from_str(&text).unwrap();
 
     assert_eq!(loaded.shortcut, saved.shortcut);
+    assert!(loaded.pause_shortening);
+    assert_eq!(loaded.pause_cutoff_ms, 3500);
+    assert!(!loaded.pause_protect_opening);
+    assert_eq!(
+        loaded.pause_opening_ms, 8000,
+        "the length is remembered even with the switch off"
+    );
     assert_eq!(
         loaded.active_local_model_id.as_deref(),
         Some("whisper-small")
@@ -932,6 +1227,220 @@ fn deleting_recordings_removes_only_recordings() {
     assert_eq!(delete_recordings_in(&dir).unwrap(), 0);
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+// ---- pause-shortening against real recordings --------------------------
+//
+// Both of these read the recordings this Mac has saved, so they are skipped
+// unless asked for by name. To run them:
+//
+//   cargo test --manifest-path src-tauri/Cargo.toml -- --ignored --nocapture
+
+// One of the 16 kHz, mono, 16-bit files the app writes. 44-byte header.
+fn read_model_input(path: &std::path::Path) -> Vec<f32> {
+    let bytes = fs::read(path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+    bytes[44..]
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / i16::MAX as f32)
+        .collect()
+}
+
+// Every "-model-input.wav" in the recordings folder: exactly what the model
+// was given on a real dictation, in the order they were recorded.
+fn corpus() -> Vec<(String, Vec<f32>)> {
+    let dir = crate::storage::get_recordings_dir().expect("no recordings folder");
+    let mut paths: Vec<std::path::PathBuf> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {}", dir.display(), e))
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("-model-input.wav"))
+        })
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "no recordings in {}", dir.display());
+
+    paths
+        .into_iter()
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let name = name.trim_end_matches("-model-input.wav").to_string();
+            (name, read_model_input(&path))
+        })
+        .collect()
+}
+
+// Where every long pause sits in every real recording, so the rule about
+// leaving the opening alone can be set from evidence rather than a guess.
+#[test]
+#[ignore = "reads the recordings saved on this Mac"]
+fn where_the_long_pauses_are_in_real_recordings() {
+    for (name, samples) in corpus() {
+        let seconds = samples.len() as f32 / 16_000.0;
+        let pauses = long_pauses(&samples, rules());
+        if pauses.is_empty() {
+            continue;
+        }
+        let list: Vec<String> = pauses
+            .iter()
+            .map(|(start, end)| {
+                format!(
+                    "{:.1}s..{:.1}s ({:.1}s long)",
+                    *start as f32 * 0.03,
+                    *end as f32 * 0.03,
+                    (end - start) as f32 * 0.03
+                )
+            })
+            .collect();
+        println!("{:<22} {:>5.1}s total   {}", name, seconds, list.join(", "));
+    }
+    println!();
+}
+
+#[test]
+#[ignore = "reads the recordings saved on this Mac"]
+fn how_much_shorter_pause_shortening_makes_real_recordings() {
+    println!(
+        "\n{:<22} {:>9} {:>9} {:>8}",
+        "recording", "before", "after", "saved"
+    );
+    let (mut total_before, mut total_after) = (0.0f32, 0.0f32);
+
+    for (name, samples) in corpus() {
+        let before = samples.len() as f32 / 16_000.0;
+        let mut shortened = samples;
+        shorten_long_pauses(&mut shortened, rules());
+        let after = shortened.len() as f32 / 16_000.0;
+        total_before += before;
+        total_after += after;
+        println!(
+            "{:<22} {:>8.1}s {:>8.1}s {:>7.0}%",
+            name,
+            before,
+            after,
+            (before - after) / before * 100.0
+        );
+    }
+
+    println!(
+        "{:<22} {:>8.1}s {:>8.1}s {:>7.0}%   <- all {} recordings\n",
+        "TOTAL",
+        total_before,
+        total_after,
+        (total_before - total_after) / total_before * 100.0,
+        corpus().len()
+    );
+}
+
+// Every recording, transcribed four times: twice untouched and twice with the
+// pauses shortened.
+//
+// Two runs of the untouched audio are what make this readable. The model does
+// not give the same text twice from the same samples, so without that control
+// every difference would look like damage done by pause-shortening. The
+// recordings it changes nothing in - no pause long enough - are the measuring
+// stick: whatever they disagree by is the model on its own.
+#[test]
+#[ignore = "loads a model and transcribes every recording four times"]
+fn pause_shortening_does_not_change_what_the_model_types() {
+    let model_id = load_prefs()
+        .active_local_model_id
+        .expect("choose a model in Settings first");
+    let models = Arc::new(crate::managers::ModelManager::new().expect("no model folder"));
+    let mut engine = crate::managers::TranscriptionManager::new(models);
+    engine.load_model(&model_id).expect("could not load model");
+    println!("\nmodel: {}\n", model_id);
+
+    // (recordings, of those where the two untouched runs disagreed, of those
+    // where neither untouched run matched either shortened run)
+    let mut untouched_audio = (0usize, 0usize, 0usize);
+    let mut shortened_audio = (0usize, 0usize, 0usize);
+    // Every recording, whether it differed or not, so nothing is hidden.
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+
+    for (name, samples) in corpus() {
+        let plain = [
+            engine
+                .transcribe(&samples, None)
+                .expect("transcribe failed"),
+            engine
+                .transcribe(&samples, None)
+                .expect("transcribe failed"),
+        ];
+        let mut shortened = samples;
+        let removed = shorten_long_pauses(&mut shortened, rules());
+        let cut = [
+            engine
+                .transcribe(&shortened, None)
+                .expect("transcribe failed"),
+            engine
+                .transcribe(&shortened, None)
+                .expect("transcribe failed"),
+        ];
+
+        let plain: Vec<&str> = plain.iter().map(|t| t.trim()).collect();
+        let cut: Vec<&str> = cut.iter().map(|t| t.trim()).collect();
+        let model_disagreed = plain[0] != plain[1];
+        // Nothing in common at all: not one of the four runs came back the
+        // same, so the shortening cannot be excused as the model wandering.
+        let no_overlap = !cut.iter().any(|c| plain.contains(c));
+
+        let counters = if removed > 0.0 {
+            &mut shortened_audio
+        } else {
+            &mut untouched_audio
+        };
+        counters.0 += 1;
+        counters.1 += usize::from(model_disagreed);
+        counters.2 += usize::from(no_overlap);
+
+        println!(
+            "--- {} ({:.1}s removed{})",
+            name,
+            removed,
+            if removed > 0.0 {
+                ""
+            } else {
+                ", audio unchanged"
+            }
+        );
+        println!("    untouched 1: {:?}", plain[0]);
+        println!("    untouched 2: {:?}", plain[1]);
+        println!("    shortened 1: {:?}", cut[0]);
+        println!("    shortened 2: {:?}", cut[1]);
+
+        rows.push(serde_json::json!({
+            "name": name,
+            "removed": removed,
+            "untouched": plain,
+            "shortened": cut,
+        }));
+    }
+
+    println!(
+        "\n{:<34} {:>7} {:>12} {:>12}",
+        "", "count", "model split", "no overlap"
+    );
+    for (what, c) in [
+        ("audio unchanged (nothing to shorten)", untouched_audio),
+        ("audio shortened", shortened_audio),
+    ] {
+        println!("{:<34} {:>7} {:>12} {:>12}", what, c.0, c.1, c.2);
+    }
+    println!(
+        "\n\"model split\" = the two untouched runs disagreed with each other.\n\
+         \"no overlap\" = neither shortened run matched either untouched run.\n"
+    );
+
+    // The same rows again as one line of JSON, so the four texts per recording
+    // can be put side by side somewhere they are readable.
+    let path = std::env::temp_dir().join("omegawhisper-pause-shortening-runs.json");
+    match serde_json::to_string(&rows).map(|text| fs::write(&path, text)) {
+        Ok(Ok(())) => println!("every run, as JSON: {}\n", path.display()),
+        _ => println!("could not write {}\n", path.display()),
+    }
 }
 
 #[test]

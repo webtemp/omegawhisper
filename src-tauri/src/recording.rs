@@ -3,8 +3,8 @@
 
 use crate::analysis::{
     audio_stats, boost_quiet_audio, chunk_level, detect_pitch, frequency_bands, holds_speech,
-    i16_to_f32, keep_recent, mix_to_mono, speech_level, to_wav_bytes, trim_quiet_edges, u16_to_f32,
-    FFT_SIZE,
+    i16_to_f32, keep_recent, mix_to_mono, shorten_long_pauses, speech_level, to_wav_bytes,
+    trim_quiet_edges, u16_to_f32, PauseRules, FFT_SIZE,
 };
 use crate::chime::{play_chime, START_CHIME};
 use crate::indicator::show_indicator;
@@ -139,6 +139,14 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
 
     // Clone transcription manager for the thread
     let transcription_manager = state.transcription_manager.0.clone();
+
+    // Read once here: the transcription thread cannot reach the app state.
+    let shorten_pauses = prefs.pause_shortening.then_some(PauseRules {
+        cutoff_ms: prefs.pause_cutoff_ms,
+        protect_opening_ms: prefs
+            .pause_protect_opening
+            .then_some(prefs.pause_opening_ms),
+    });
 
     // Cleared, then given room below once the sample rate is known.
     state.recorded_samples.lock().unwrap().clear();
@@ -329,9 +337,14 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
                 return;
             }
 
-            // Drop the quiet head and tail, then raise the level, then
+            // Drop the quiet head and tail, shorten the long pauses left in
+            // the middle if that is switched on, then raise the level, then
             // save, so the saved file is exactly what the model was given.
             let trimmed = trim_quiet_edges(&mut all_audio);
+            let shortened = match shorten_pauses {
+                Some(rules) => shorten_long_pauses(&mut all_audio, rules),
+                None => 0.0,
+            };
             let gain = boost_quiet_audio(&mut all_audio);
             let level_after = speech_level(&all_audio);
             let saved_input = save_model_input(&all_audio);
@@ -380,7 +393,7 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
             // on one line, so two dictations can be compared directly.
             eprintln!(
                 "[{}] dictation: model={} audio={:.1}s \
-                 peak={:.2} rms={:.3} silence={:.0}% trimmed={:.1}s \
+                 peak={:.2} rms={:.3} silence={:.0}% trimmed={:.1}s pauses={:.1}s \
                  speech={:.4}->{:.4} gain={:.1}x took={:.1}s",
                 now(),
                 model_id,
@@ -389,6 +402,7 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
                 rms,
                 silence * 100.0,
                 trimmed,
+                shortened,
                 level_before,
                 level_after,
                 gain,

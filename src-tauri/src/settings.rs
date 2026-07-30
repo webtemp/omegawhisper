@@ -26,6 +26,23 @@ pub(crate) struct Prefs {
     /// None means whichever one the system has set as default.
     #[serde(default)]
     pub(crate) selected_microphone: Option<String>,
+    /// Shorten long pauses in the middle of a recording before the model reads
+    /// it. Off by default: it changes what the model hears, and the time it
+    /// saves is under a second.
+    #[serde(default)]
+    pub(crate) pause_shortening: bool,
+    /// How long a pause has to be before any of it is removed.
+    #[serde(default = "default_pause_cutoff_ms")]
+    pub(crate) pause_cutoff_ms: u32,
+    /// Never shorten a pause in the first seconds after the first spoken word.
+    /// On by default; the opening is what Whisper reads the language and the
+    /// writing style from.
+    #[serde(default = "default_true")]
+    pub(crate) pause_protect_opening: bool,
+    /// How much of the opening that covers. Remembered while the switch above
+    /// is off, so turning it back on does not lose the number.
+    #[serde(default = "default_pause_opening_ms")]
+    pub(crate) pause_opening_ms: u32,
     /// Set once the settings held in the browser have been copied into here, so
     /// the copy happens exactly once and never overwrites a later change.
     #[serde(default)]
@@ -36,6 +53,22 @@ pub(crate) fn default_shortcut() -> String {
     "F3".to_string()
 }
 
+// 2.2 seconds. Shorter than this and it starts editing the breaths between
+// sentences, which is where Whisper gets its full stops from.
+pub(crate) fn default_pause_cutoff_ms() -> u32 {
+    2200
+}
+
+// 3 seconds: long enough to cover the first sentence, which is what Whisper
+// settles the language and the writing style from.
+pub(crate) fn default_pause_opening_ms() -> u32 {
+    3000
+}
+
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
@@ -43,6 +76,10 @@ impl Default for Prefs {
             shortcut: default_shortcut(),
             active_local_model_id: None,
             selected_microphone: None,
+            pause_shortening: false,
+            pause_cutoff_ms: default_pause_cutoff_ms(),
+            pause_protect_opening: true,
+            pause_opening_ms: default_pause_opening_ms(),
             migrated_from_browser: false,
         }
     }
@@ -153,4 +190,47 @@ pub(crate) fn set_debug_stats(app: AppHandle, enabled: bool) {
 #[tauri::command]
 pub(crate) fn get_debug_stats(state: State<'_, AudioState>) -> bool {
     state.prefs().debug_stats
+}
+
+// The three pause-shortening settings. Async so writing the settings file
+// cannot freeze the window.
+#[tauri::command]
+pub(crate) async fn set_pause_shortening(
+    state: State<'_, AudioState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.update_prefs(|p| p.pause_shortening = enabled);
+    Ok(())
+}
+
+// The window already limits what can be typed; this is the same limit again,
+// because a settings file edited by hand reaches here too. Below 500 ms there
+// is nothing left to remove once the 300 ms gap is kept.
+#[tauri::command]
+pub(crate) async fn set_pause_cutoff_ms(
+    state: State<'_, AudioState>,
+    milliseconds: u32,
+) -> Result<u32, String> {
+    let milliseconds = milliseconds.clamp(500, 30_000);
+    state.update_prefs(|p| p.pause_cutoff_ms = milliseconds);
+    Ok(milliseconds)
+}
+
+#[tauri::command]
+pub(crate) async fn set_pause_protect_opening(
+    state: State<'_, AudioState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.update_prefs(|p| p.pause_protect_opening = enabled);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn set_pause_opening_ms(
+    state: State<'_, AudioState>,
+    milliseconds: u32,
+) -> Result<u32, String> {
+    let milliseconds = milliseconds.min(30_000);
+    state.update_prefs(|p| p.pause_opening_ms = milliseconds);
+    Ok(milliseconds)
 }
