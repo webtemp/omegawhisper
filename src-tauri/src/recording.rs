@@ -317,6 +317,8 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
                     DictationStats {
                         model: "skipped - no speech".to_string(),
                         seconds: audio_seconds,
+                        trimmed: 0.0,
+                        shortened: 0.0,
                         level_before,
                         level_after: level_before,
                         gain: 1.0,
@@ -378,6 +380,8 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
                 DictationStats {
                     model: model_id.clone(),
                     seconds: audio_seconds,
+                    trimmed,
+                    shortened,
                     level_before,
                     level_after,
                     gain,

@@ -21,6 +21,38 @@ type MicLevel = {
   bands: number[];
 };
 
+// What one finished dictation did. Sent once, after the model returns, and the
+// same numbers as the "dictation:" line in the log.
+type DictationStats = {
+  model: string;
+  seconds: number;
+  trimmed: number;
+  shortened: number;
+  level_before: number;
+  level_after: number;
+  gain: number;
+  took: number;
+  chars: number;
+};
+
+// Two short lines, not one long one: the window is 460px wide and a single
+// line ran off the end of it.
+//
+// The first says what happened, the second what was done to the audio. The
+// loudness boost is left out unless it did something - it is off for anyone
+// who is not speaking quietly, and "0.145 -> 0.145  gain 1.0x" reads as a
+// broken number rather than as "nothing needed doing".
+function describeDictation(s: DictationStats): string[] {
+  const boosted = s.gain > 1.005;
+  return [
+    `${s.model}  ${s.seconds.toFixed(1)}s  took ${s.took.toFixed(1)}s  ${s.chars} chars`,
+    `trim ${s.trimmed.toFixed(1)}s  pauses ${s.shortened.toFixed(1)}s  speech ` +
+      (boosted
+        ? `${s.level_before.toFixed(3)}→${s.level_after.toFixed(3)} (gain ${s.gain.toFixed(1)}x)`
+        : s.level_after.toFixed(3)),
+  ];
+}
+
 // A ring of bars pointing outwards, their lengths running around the circle in
 // a wave. Shown while the model is working, where there is no live sound to
 // draw, so the wave is made from three sine waves at different speeds instead:
@@ -112,6 +144,9 @@ export function Indicator() {
   const [showStats, setShowStats] = useState(false);
   // The drawing loop cannot read React state, so it reads this.
   const showStatsRef = useRef(false);
+  // What the last dictation did. Cleared when the next one starts, so an old
+  // line is never read as the new one.
+  const [lastDictation, setLastDictation] = useState<DictationStats | null>(null);
 
   // The settings the deleted main window kept in browser storage. This window
   // loads on every launch, shown or not, so it is the one that can hand them
@@ -376,6 +411,11 @@ export function Indicator() {
         listen("transcription-processing", () => {
           setTranscribing(true);
         }),
+        // Sent once the model returns, including when the recording was
+        // skipped for holding no speech.
+        listen<DictationStats>("dictation-stats", (e) => {
+          setLastDictation(e.payload);
+        }),
         listen("transcription-complete", () => {
           setTranscribing(false);
         }),
@@ -385,6 +425,13 @@ export function Indicator() {
             errorRef.current = false;
             setErrorText(null);
           }
+          // And so is the last dictation's line. These only arrive while
+          // recording, which is the one moment that means a new dictation has
+          // started - clearing on "transcription-processing" instead left the
+          // previous run's numbers on screen for the whole of the next one.
+          // Returning the old value unchanged costs nothing when it is
+          // already empty, which it is 20 times a second.
+          setLastDictation((previous) => (previous ? null : previous));
         })
       );
     } catch {
@@ -447,7 +494,9 @@ export function Indicator() {
           left: 0,
           right: 0,
           display: showStats ? "flex" : "none",
-          justifyContent: "center",
+          flexDirection: "column",
+          alignItems: "center",
+          gap: 3,
           pointerEvents: "none",
         }}
       >
@@ -463,6 +512,33 @@ export function Indicator() {
             border: "1px solid rgba(255, 255, 255, 0.12)",
           }}
         />
+        {/* What the dictation that just finished did. The window is held on
+            screen for a few seconds while this is on, so it can be read. */}
+        {lastDictation && (
+          <div
+            style={{
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+              fontSize: 10,
+              lineHeight: 1.5,
+              textAlign: "center",
+              // Wraps rather than being cut off. Nothing here is worth hiding.
+              overflowWrap: "anywhere",
+              padding: "3px 10px",
+              borderRadius: 7,
+              background: "rgba(10, 14, 20, 0.82)",
+              border: "1px solid rgba(255, 255, 255, 0.12)",
+              // A dictation that typed nothing is the one worth noticing.
+              color:
+                lastDictation.chars === 0
+                  ? "rgb(255, 196, 100)"
+                  : "rgba(226, 248, 255, 0.75)",
+            }}
+          >
+            {describeDictation(lastDictation).map((line) => (
+              <div key={line}>{line}</div>
+            ))}
+          </div>
+        )}
       </div>
       <div
         ref={textRef}
