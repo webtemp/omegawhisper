@@ -128,13 +128,20 @@ struct MicLevel {
     bands: Vec<f32>,
 }
 
-// What one finished local dictation did, shown in the main window so the
-// numbers behind a bad result are visible without reading a log file.
+// What one finished local dictation did, shown on the indicator so the numbers
+// behind a bad result are visible without reading a log file. Every field on
+// the "dictation:" log line is here, so the two can never tell different
+// stories.
 #[derive(Clone, serde::Serialize)]
 struct DictationStats {
     model: String,
     // Length of the audio handed to the model.
     seconds: f32,
+    // Seconds cut off the quiet start and end.
+    trimmed: f32,
+    // Seconds taken out of the pauses in the middle. 0 unless pause-shortening
+    // is switched on and found a pause long enough.
+    shortened: f32,
     // Loudness of the spoken parts, before and after the level boost.
     level_before: f32,
     level_after: f32,
@@ -326,10 +333,19 @@ pub fn run() {
                 use tauri::Listener;
                 watch_indicator(app.handle().clone());
 
+                use tauri::Manager;
                 let handle = app.handle().clone();
                 app.listen_any("transcription-complete", move |_| {
                     play_chime(&DONE_CHIME);
-                    hide_indicator_in(&handle, Duration::from_millis(400));
+                    // The per-dictation numbers arrive just before this, and
+                    // 400 ms is not long enough to read them. Only waited for
+                    // when they are actually being shown.
+                    let linger = if handle.state::<AudioState>().prefs().debug_stats {
+                        Duration::from_secs(5)
+                    } else {
+                        Duration::from_millis(400)
+                    };
+                    hide_indicator_in(&handle, linger);
                 });
 
                 // Errors can arrive after the indicator has already gone, so
