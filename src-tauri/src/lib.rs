@@ -605,6 +605,30 @@ pub fn run() {
             let _ = app; // Silence unused warning on non-Linux
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // Let the model go before the process ends.
+            //
+            // Quitting ends the process through C's exit(). That runs the
+            // teardown C and C++ code registered, but not Rust's, so a loaded
+            // model is never dropped. Whisper's Metal teardown is one of the C
+            // ones, and it checks that every GPU buffer it handed out has been
+            // given back. It finds the model still holding some and stops the
+            // process on the way out:
+            //   ggml-metal-device.m: GGML_ASSERT([rsets->data count] == 0) failed
+            // Nothing is lost when that happens - the text has been typed and
+            // the settings were written the moment they changed - but the exit
+            // code is wrong and the log ends in a page of addresses.
+            //
+            // Dropping the model here, while Rust is still running, is what
+            // makes that check pass. RunEvent::Exit covers every ordinary way
+            // out: the tray's Quit, and macOS asking the app to close.
+            if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                app.state::<AudioState>()
+                    .transcription_manager
+                    .unload_model();
+            }
+        });
 }
