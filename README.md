@@ -195,6 +195,16 @@ To use a different key, open **Settings** → **Dictation key** → **Change**, 
 combination you want. If it is already taken by another app it says so and keeps the old
 one, so you can never end up with no shortcut.
 
+### Starting it automatically
+
+**Settings** → **Startup** → **Start when the computer starts**. After logging in the
+menu-bar icon is there and the dictation key works; no window opens.
+
+This writes `~/Library/LaunchAgents/Omegawhisper.plist`, which holds the full path to the
+app. Move the app to another folder and that path is wrong, so the app writes the file
+again at every startup, pointing at wherever it is being run from. Switching it off
+deletes the file. macOS also lists it under System Settings → General → Login Items.
+
 The menu-bar icon has:
 
 | Item | What it does |
