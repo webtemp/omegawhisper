@@ -310,6 +310,8 @@ pub fn run() {
             settings::set_pause_opening_ms,
             settings::get_start_at_login,
             settings::set_start_at_login,
+            settings::set_onnx_gpu,
+            settings::set_whisper_gpu,
             shortcut::get_shortcut,
             shortcut::set_shortcut,
             get_startup_warnings,

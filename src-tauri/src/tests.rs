@@ -3,6 +3,7 @@
 // No microphone, no model, no windows.
 use crate::analysis::*;
 use crate::chime::*;
+use crate::managers::transcription::{needs_load, onnx_accelerator, GpuChoice};
 use crate::settings::*;
 use crate::storage::delete_recordings_in;
 use crate::*;
@@ -993,6 +994,8 @@ fn every_setting_survives_being_written_and_read_back() {
         pause_cutoff_ms: 3500,
         pause_protect_opening: false,
         pause_opening_ms: 8000,
+        onnx_gpu: true,
+        whisper_gpu: false,
         migrated_from_browser: true,
     };
     let text = serde_json::to_string(&saved).unwrap();
@@ -1015,6 +1018,109 @@ fn every_setting_survives_being_written_and_read_back() {
         Some("MacBook Pro Microphone")
     );
     assert!(loaded.migrated_from_browser);
+    assert!(loaded.onnx_gpu, "the ONNX GPU switch is written and read back");
+    assert!(
+        !loaded.whisper_gpu,
+        "and so is the Whisper one, including when it is off"
+    );
+}
+
+// ---- which runtime gets the GPU ---------------------------------------
+//
+// The two switches point opposite ways by default, which is the whole reason
+// they are two switches. Measured on an M2 Pro, 12.2 s of speech, second run:
+//
+//   Whisper Turbo    GPU 1.74 s    CPU 7.20 s     -> GPU, by 4.1x
+//   Parakeet v3      GPU 642 ms    CPU 360 ms     -> CPU, by 1.8x
+//   Moonshine base   GPU 400 ms    CPU 302 ms     -> CPU, by 1.3x
+//
+// On 70 s of speech Parakeet took 12-24 s on the GPU against 2.3 s on the
+// processor, so the gap grows with the length of the dictation.
+
+#[test]
+fn the_gpu_switches_start_pointing_opposite_ways() {
+    let fresh = Prefs::default();
+    assert!(
+        !fresh.onnx_gpu,
+        "Parakeet and Moonshine start on the processor, which measured faster"
+    );
+    assert!(
+        fresh.whisper_gpu,
+        "Whisper starts on the GPU, where it is four times faster"
+    );
+}
+
+#[test]
+fn a_settings_file_from_before_the_gpu_switches_keeps_the_measured_defaults() {
+    // Anyone updating has a file with neither field in it. It must not read
+    // as "both off", which would make Whisper four times slower, nor as
+    // "both on", which is the slow arrangement this change exists to fix.
+    let old = r#"{"debug_stats":true,"shortcut":"F3","pause_shortening":true}"#;
+    let prefs: Prefs = serde_json::from_str(old).expect("an old file still loads");
+
+    assert!(!prefs.onnx_gpu, "ONNX falls back to the processor");
+    assert!(prefs.whisper_gpu, "Whisper falls back to the GPU");
+    assert!(prefs.pause_shortening, "and the rest of the file is intact");
+}
+
+#[test]
+fn the_onnx_switch_picks_the_right_provider() {
+    use transcribe_rs::OrtAccelerator;
+    assert_eq!(
+        onnx_accelerator(false),
+        OrtAccelerator::CpuOnly,
+        "off means the processor, not the library's own choice"
+    );
+    assert_eq!(
+        onnx_accelerator(true),
+        OrtAccelerator::Auto,
+        "on hands the choice back to the library, which picks CoreML on a Mac"
+    );
+}
+
+#[test]
+fn moving_a_gpu_switch_makes_the_next_dictation_build_the_model_again() {
+    let cpu = GpuChoice {
+        onnx: false,
+        whisper: true,
+    };
+    let onnx_on = GpuChoice {
+        onnx: true,
+        whisper: true,
+    };
+    let whisper_off = GpuChoice {
+        onnx: false,
+        whisper: false,
+    };
+
+    assert!(
+        needs_load(None, "parakeet-v3-int8", cpu),
+        "nothing loaded yet"
+    );
+    assert!(
+        !needs_load(Some(("parakeet-v3-int8", cpu)), "parakeet-v3-int8", cpu),
+        "same model, same switches: the one in memory is used again"
+    );
+    assert!(
+        needs_load(Some(("parakeet-v3-int8", cpu)), "whisper-turbo", cpu),
+        "a different model always means building"
+    );
+
+    // The point of the whole test: a model in memory was built with the
+    // switches as they were. Moving one has to throw it away, or the switch
+    // would look dead until the next restart.
+    assert!(
+        needs_load(Some(("parakeet-v3-int8", cpu)), "parakeet-v3-int8", onnx_on),
+        "same model, ONNX switch moved"
+    );
+    assert!(
+        needs_load(
+            Some(("whisper-turbo", cpu)),
+            "whisper-turbo",
+            whisper_off
+        ),
+        "same model, Whisper switch moved"
+    );
 }
 
 #[test]
@@ -1272,6 +1378,130 @@ fn corpus() -> Vec<(String, Vec<f32>)> {
         .collect()
 }
 
+// The two GPU switches, timed against each other on every model on this Mac
+// and a real recording. This is what the defaults in `Prefs` are set from; run
+// it on any Mac to find out whether they are right for that machine.
+//
+//   cargo test --manifest-path src-tauri/Cargo.toml --release -- --ignored \
+//       --nocapture both_gpu_switches
+//
+// It asserts only that both settings produce text. Speed is printed, not
+// asserted: a timing test that fails on a busy machine is worse than no test.
+#[test]
+#[ignore = "loads every model on this Mac twice over and times them"]
+fn both_gpu_switches_change_where_the_model_runs() {
+    let models = Arc::new(crate::managers::ModelManager::new().expect("no model folder"));
+
+    // Every model on this Mac, not only the chosen one, so a single run covers
+    // both switches: Whisper answers to Metal, the rest to CoreML.
+    let downloaded: Vec<&str> = crate::managers::AVAILABLE_MODELS
+        .iter()
+        .map(|m| m.id)
+        .filter(|id| models.is_model_downloaded(id))
+        .collect();
+    assert!(!downloaded.is_empty(), "download a model in Settings first");
+
+    // The longest recording on this Mac, cut to a minute. The gap between
+    // processor and GPU grows with the length of the audio, so the shortest
+    // recording would hide it - but the longest one here was a whole meeting,
+    // and transcribing it four times took eighteen minutes. A minute is long
+    // enough to show the difference and short enough to sit through, and it
+    // stays under the 64 seconds Moonshine refuses to go past.
+    const MOST_SECONDS: usize = 60;
+    let (name, mut samples) = corpus()
+        .into_iter()
+        .max_by_key(|(_, samples)| samples.len())
+        .expect("no recordings");
+    let full_seconds = samples.len() as f32 / 16_000.0;
+    samples.truncate(MOST_SECONDS * 16_000);
+    println!(
+        "\naudio: {} ({:.1}s of {:.1}s)\nmodels: {}",
+        name,
+        samples.len() as f32 / 16_000.0,
+        full_seconds,
+        downloaded.join(", ")
+    );
+
+    for model_id in downloaded {
+        // Whisper is the only one on Metal; everything else is on CoreML. Only
+        // the switch that model actually answers to is moved.
+        let on_metal = model_id.starts_with("whisper");
+        println!(
+            "\n{} - {}",
+            model_id,
+            if on_metal {
+                "whisper.cpp, so the Whisper switch"
+            } else {
+                "ONNX Runtime, so the Parakeet and Moonshine switch"
+            }
+        );
+
+        let mut timings = Vec::new();
+        for gpu_on in [false, true] {
+            let gpu = GpuChoice {
+                onnx: !on_metal && gpu_on,
+                whisper: on_metal && gpu_on,
+            };
+
+            // A fresh manager each time, so nothing built the other way is
+            // left in memory - the mistake that made an earlier hand
+            // measurement of this show no difference at all.
+            let mut engine = crate::managers::TranscriptionManager::new(models.clone());
+
+            let started = std::time::Instant::now();
+            engine.load_model(model_id, gpu).expect("could not load");
+            let load = started.elapsed();
+
+            // Twice: the first run pays one-off setup a later dictation would
+            // not, and it is the later dictations that matter.
+            let mut run = std::time::Duration::ZERO;
+            let mut text = String::new();
+            let mut refused = None;
+            for _ in 0..2 {
+                let started = std::time::Instant::now();
+                match engine.transcribe(&samples, None) {
+                    Ok(got) => {
+                        text = got;
+                        run = started.elapsed();
+                    }
+                    Err(e) => {
+                        refused = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = refused {
+                println!("  refused the audio: {}", e);
+                break;
+            }
+
+            assert!(
+                !text.trim().is_empty(),
+                "{} produced no text with the GPU {}",
+                model_id,
+                if gpu_on { "on" } else { "off" }
+            );
+            println!(
+                "  GPU {:3}   load {:>9.2?}   transcribe {:>9.2?}",
+                if gpu_on { "on" } else { "off" },
+                load,
+                run
+            );
+            timings.push(run);
+        }
+
+        // Only when both halves ran. A model that refused the audio has one.
+        if let [cpu, gpu] = timings[..] {
+            let (faster, ratio) = if cpu <= gpu {
+                ("the processor", gpu.as_secs_f64() / cpu.as_secs_f64())
+            } else {
+                ("the GPU", cpu.as_secs_f64() / gpu.as_secs_f64())
+            };
+            println!("  -> {} wins, by {:.1}x", faster, ratio);
+        }
+    }
+}
+
 // Where every long pause sits in every real recording, so the rule about
 // leaving the opening alone can be set from evidence rather than a guess.
 #[test]
@@ -1350,7 +1580,17 @@ fn pause_shortening_does_not_change_what_the_model_types() {
         .expect("choose a model in Settings first");
     let models = Arc::new(crate::managers::ModelManager::new().expect("no model folder"));
     let mut engine = crate::managers::TranscriptionManager::new(models);
-    engine.load_model(&model_id).expect("could not load model");
+    // The saved switches, so this measures the model the way the app runs it.
+    let saved = load_prefs();
+    engine
+        .load_model(
+            &model_id,
+            GpuChoice {
+                onnx: saved.onnx_gpu,
+                whisper: saved.whisper_gpu,
+            },
+        )
+        .expect("could not load model");
     println!("\nmodel: {}\n", model_id);
 
     // (recordings, of those where the two untouched runs disagreed, of those

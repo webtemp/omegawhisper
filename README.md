@@ -204,6 +204,35 @@ This writes `~/Library/LaunchAgents/Omegawhisper.plist`, which holds the full pa
 app. Move the app to another folder and that path is wrong, so the app writes the file
 again at every startup, pointing at wherever it is being run from. Switching it off
 deletes the file. macOS also lists it under System Settings → General → Login Items.
+### Which models use the graphics card
+
+**Settings** → **Graphics card**. Two switches, because the two kinds of model
+answer differently.
+
+One minute of speech, on an M2 Pro:
+
+| Model | Setting | Graphics card | Processor |
+|---|---|---|---|
+| Whisper Turbo | **on** | **3.3 s** | 12.2 s |
+| Parakeet v3 | **off** | 6.8 s | **1.9 s** |
+| Moonshine Base | **off** | 2.6 s | **1.7 s** |
+
+Whisper runs on whisper.cpp through Metal. Parakeet and Moonshine run on ONNX
+Runtime through CoreML. They are separate, so one switch cannot serve both.
+
+The reason the second one loses: those models are quantised to 8-bit integers,
+which CoreML handles poorly — it hands parts back to the processor and pays for
+the crossing each time. Loading is slower too: Parakeet takes 5.7 seconds to
+load on the graphics card against 0.6 on the processor.
+
+These numbers are from one Mac, an M2 Pro. On yours, run:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml --release -- --ignored --nocapture both_gpu_switches
+```
+
+It times every model you have downloaded, both ways, and prints which won for
+each. Either switch takes effect on the next dictation.
 
 The menu-bar icon has:
 
