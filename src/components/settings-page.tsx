@@ -77,6 +77,11 @@ export function SettingsPage() {
   // The debug line. Read on its own below because the tray menu sets it too.
   const [showDebugStats, setShowDebugStats] = useState(false);
 
+  // Start when the computer starts. Read on its own too: the system holds it,
+  // not the settings file, and the user can switch it off in System Settings.
+  const [startAtLogin, setStartAtLogin] = useState(false);
+  const [startAtLoginError, setStartAtLoginError] = useState<string | null>(null);
+
   // Shorten long pauses before the model reads the recording. The two lengths
   // are kept as text while being typed, so a half-typed number is not saved.
   const [pauseShortening, setPauseShortening] = useState(false);
@@ -240,6 +245,29 @@ export function SettingsPage() {
       unlisten.then((fn) => fn()).catch(() => {});
     };
   }, []);
+
+  // Ask the system, every time this window opens, whether the app is set to
+  // start at login.
+  useEffect(() => {
+    invoke<boolean>("get_start_at_login")
+      .then(setStartAtLogin)
+      .catch((err) => setStartAtLoginError(String(err)));
+  }, []);
+
+  // The switch shows what the system says. Move it only once the system has
+  // agreed, so a failure leaves it where it really is instead of lying.
+  const toggleStartAtLogin = async () => {
+    const next = !startAtLogin;
+    setStartAtLoginError(null);
+    try {
+      await invoke("set_start_at_login", { enabled: next });
+      setStartAtLogin(next);
+    } catch (err) {
+      setStartAtLoginError(
+        `Could not ${next ? "turn this on" : "turn this off"}: ${err}`
+      );
+    }
+  };
 
   // Load audio devices and app version
   useEffect(() => {
@@ -416,6 +444,38 @@ export function SettingsPage() {
             </div>
             {shortcutError && (
               <p className="text-xs text-red-400">{shortcutError}</p>
+            )}
+          </div>
+
+          {/* Startup. Next to the dictation key because both are about being
+              able to dictate without going looking for the app first. */}
+          <div className="space-y-2">
+            <Label className="text-xs uppercase tracking-wide text-white/50">
+              Startup
+            </Label>
+            <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
+              <div className="pr-3">
+                <span className="text-sm text-white">Start when the computer starts</span>
+                <p className="text-xs text-white/40">
+                  Omegawhisper appears in the menu bar after logging in, ready
+                  for the dictation key. No window opens.
+                </p>
+              </div>
+              <button
+                onClick={toggleStartAtLogin}
+                className={`shrink-0 w-10 h-5 rounded-full transition-colors ${
+                  startAtLogin ? "bg-green-500" : "bg-white/20"
+                }`}
+              >
+                <div
+                  className={`w-4 h-4 rounded-full bg-white transition-transform ${
+                    startAtLogin ? "translate-x-5" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+            {startAtLoginError && (
+              <p className="text-xs text-red-400">{startAtLoginError}</p>
             )}
           </div>
 

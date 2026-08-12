@@ -62,6 +62,7 @@ Read these in the code, not a copy here: `AudioState` at the top of `lib.rs`, `P
 
 ## Notes
 - Rust owns every setting. They live in `tray-prefs.json` next to the models and are saved the moment they change. The windows read them with `get_settings` and never keep their own copy — `localStorage` is not used for settings at all.
+- One setting is not in `tray-prefs.json`: Start at login. The system holds it — on macOS the file `~/Library/LaunchAgents/Omegawhisper.plist`, written by `tauri-plugin-autostart` — and the user can delete it in System Settings, so a copy here could disagree. `get_start_at_login` asks the system every time. That file holds the app's full path and nothing checks it still leads anywhere, so `refresh_start_at_login` writes it again at startup; release builds only, or a `tauri dev` run would point login at the binary in `target/`.
 - Two threads: capture (cpal; stereo to mono by averaging; F32/I16/U16) and transcription. Local transcription runs *after* the stop, which is why the app looks frozen for a moment. Linux adds a D-Bus thread.
 - macOS builds add `whisper-metal` and `ort-coreml` so models run on the GPU; without them it falls back to the CPU and is far slower.
 - Typing into other apps uses `core-graphics` Unicode key events on macOS, `ydotool`/`wtype`/`xdotool` on Linux.

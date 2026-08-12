@@ -234,3 +234,61 @@ pub(crate) async fn set_pause_opening_ms(
     state.update_prefs(|p| p.pause_opening_ms = milliseconds);
     Ok(milliseconds)
 }
+
+// Start the app when the computer starts.
+//
+// This one setting is not in tray-prefs.json. The system holds it: on macOS it
+// is the file ~/Library/LaunchAgents/Omegawhisper.plist, which the user can
+// also delete from System Settings. A copy here could say "on" while the file
+// is gone, so the system is asked every time instead.
+
+#[tauri::command]
+pub(crate) fn get_start_at_login(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn set_start_at_login(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    match result {
+        Ok(()) => {
+            eprintln!("Start at login: {}", if enabled { "on" } else { "off" });
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Could not change start at login: {}", e);
+            Err(e.to_string())
+        }
+    }
+}
+
+// The saved login entry holds the full path to the app, and nothing checks
+// that the path still leads anywhere. Move the app to another folder and it
+// silently stops starting. Writing the entry again at every startup points it
+// at wherever the app is being run from now.
+//
+// Only in a release build. A `bun run tauri dev` run would otherwise point the
+// login entry at the development binary in `target/`.
+pub(crate) fn refresh_start_at_login(app: &AppHandle) {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    match manager.is_enabled() {
+        Ok(true) => {
+            if let Err(e) = manager.enable() {
+                eprintln!("Could not point start at login at this copy of the app: {}", e);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => eprintln!("Could not read start at login: {}", e),
+    }
+}

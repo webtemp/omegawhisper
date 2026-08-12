@@ -269,6 +269,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Starting the app when the computer starts. LaunchAgent writes a file
+        // in ~/Library/LaunchAgents; the other choice, AppleScript, makes macOS
+        // ask the user to let Omegawhisper control System Events first.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         // Global shortcut toggles recording from anywhere.
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -301,11 +308,17 @@ pub fn run() {
             settings::set_pause_cutoff_ms,
             settings::set_pause_protect_opening,
             settings::set_pause_opening_ms,
+            settings::get_start_at_login,
+            settings::set_start_at_login,
             shortcut::get_shortcut,
             shortcut::set_shortcut,
             get_startup_warnings,
         ])
         .setup(|app| {
+            // Keep the login entry pointing at this copy of the app.
+            #[cfg(desktop)]
+            settings::refresh_start_at_login(app.handle());
+
             // The saved key toggles recording from anywhere.
             #[cfg(desktop)]
             {
