@@ -9,8 +9,8 @@ use transcribe_rs::whisper_cpp::{WhisperEngine, WhisperInferenceParams, WhisperL
 /// Metal; the rest run on ONNX Runtime and CoreML. They share nothing, so they
 /// are answered separately.
 ///
-/// Read at every load, because both are decided while the model is being built
-/// and cannot be changed once it is in memory.
+/// Both are settled while a model is being built and cannot be changed while
+/// it is in memory, which is what `needs_load` below is for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GpuChoice {
     /// CoreML for Parakeet and Moonshine.
@@ -31,13 +31,9 @@ pub fn onnx_accelerator(gpu: bool) -> transcribe_rs::OrtAccelerator {
 
 /// Whether a dictation has to build the model, given what is already in memory.
 ///
-/// `loaded` is the model in memory and the switches it was built with, or None
-/// when there is nothing loaded yet.
-///
-/// The switches are half of the answer, not just the name. A model already in
-/// memory was built with whichever switch was on at the time, and that cannot
-/// be changed afterwards; without checking them, moving a switch would appear
-/// to do nothing until the app was restarted or another model chosen.
+/// The switches count as much as the name: a model built while a switch was on
+/// goes on using it. Comparing the name alone would leave a moved switch doing
+/// nothing until the app was restarted or another model chosen.
 pub fn needs_load(loaded: Option<(&str, GpuChoice)>, model_id: &str, gpu: GpuChoice) -> bool {
     loaded != Some((model_id, gpu))
 }
@@ -119,13 +115,9 @@ impl TranscriptionManager {
         }
     }
 
-    /// Whether the next dictation has to build the model again.
-    pub fn needs_load(&self, model_id: &str, gpu: GpuChoice) -> bool {
-        needs_load(
-            self.current_model_id.as_deref().zip(self.loaded_with),
-            model_id,
-            gpu,
-        )
+    /// What is in memory now: the model and the switches it was built with.
+    fn loaded(&self) -> Option<(&str, GpuChoice)> {
+        self.current_model_id.as_deref().zip(self.loaded_with)
     }
 
     /// Check if a model is currently loaded
@@ -137,7 +129,7 @@ impl TranscriptionManager {
     /// Load a model by ID
     pub fn load_model(&mut self, model_id: &str, gpu: GpuChoice) -> Result<(), String> {
         // Already in memory, and built the way the settings ask for.
-        if !self.needs_load(model_id, gpu) {
+        if !needs_load(self.loaded(), model_id, gpu) {
             return Ok(());
         }
 
@@ -210,11 +202,16 @@ impl TranscriptionManager {
         self.loaded_engine = Some(engine);
         self.current_model_id = Some(model_id.to_string());
         self.loaded_with = Some(gpu);
+        // Only the switch this model answers to. Naming the other one as well
+        // reads as though it were in use.
+        let on_gpu = match model_info.engine_type {
+            EngineType::Whisper => gpu.whisper,
+            _ => gpu.onnx,
+        };
         eprintln!(
-            "Loaded {} (ONNX on {}, Whisper on {})",
+            "Loaded {} on the {}",
             model_id,
-            if gpu.onnx { "GPU" } else { "CPU" },
-            if gpu.whisper { "GPU" } else { "CPU" },
+            if on_gpu { "GPU" } else { "processor" }
         );
 
         Ok(())
