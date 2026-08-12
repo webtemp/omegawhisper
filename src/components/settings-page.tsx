@@ -67,11 +67,7 @@ function ModelsAffected({ models }: { models: ModelInfo[] }) {
           {index > 0 && ", "}
           <span
             className={model.status === "downloaded" ? "text-white/60" : undefined}
-            title={
-              model.status === "downloaded"
-                ? "downloaded"
-                : "not downloaded, so nothing changes for it yet"
-            }
+            title={model.status === "downloaded" ? "Downloaded" : "Not downloaded"}
           >
             {model.name}
           </span>
@@ -667,10 +663,6 @@ export function SettingsPage() {
             <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
               <div className="pr-3">
                 <span className="text-sm text-white">Run Whisper on the graphics card</span>
-                <p className="text-xs text-white/40">
-                  Measured on this Mac: 3.3 seconds against 12.2 on the
-                  processor, for the same minute of speech. Leave it on.
-                </p>
                 <ModelsAffected models={whisperModels} />
               </div>
               <button
@@ -694,11 +686,6 @@ export function SettingsPage() {
             <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
               <div className="pr-3">
                 <span className="text-sm text-white">Run Parakeet and Moonshine on the graphics card</span>
-                <p className="text-xs text-white/40">
-                  Off, because it is slower: over a minute of speech Parakeet
-                  took 6.8 seconds against 1.9 on the processor, Moonshine 2.6
-                  against 1.7. Worth trying if your Mac is newer than an M2.
-                </p>
                 <ModelsAffected models={onnxModels} />
               </div>
               <button
@@ -719,10 +706,6 @@ export function SettingsPage() {
               </button>
             </div>
 
-            <p className="text-xs text-white/30">
-              Either switch takes effect on the next dictation, which loads the
-              model again and so takes a moment longer than usual.
-            </p>
           </div>
 
           {/* Pause-shortening. Experimental, so it stays off unless it is
