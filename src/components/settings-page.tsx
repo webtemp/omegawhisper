@@ -51,6 +51,8 @@ interface Settings {
   pause_cutoff_ms: number;
   pause_protect_opening: boolean;
   pause_opening_ms: number;
+  onnx_gpu: boolean;
+  whisper_gpu: boolean;
 }
 
 export function SettingsPage() {
@@ -76,6 +78,11 @@ export function SettingsPage() {
 
   // The debug line. Read on its own below because the tray menu sets it too.
   const [showDebugStats, setShowDebugStats] = useState(false);
+
+  // Which of the two runtimes may use the GPU. Two switches, not one: Whisper
+  // is much faster on the GPU and the others are slower on it.
+  const [onnxGpu, setOnnxGpu] = useState(false);
+  const [whisperGpu, setWhisperGpu] = useState(true);
 
   // Shorten long pauses before the model reads the recording. The two lengths
   // are kept as text while being typed, so a half-typed number is not saved.
@@ -111,6 +118,8 @@ export function SettingsPage() {
         const saved = await invoke<Settings>("get_settings");
         setActiveModelId(saved.active_local_model_id);
         setMicrophone(saved.selected_microphone);
+        setOnnxGpu(saved.onnx_gpu);
+        setWhisperGpu(saved.whisper_gpu);
         setPauseShortening(saved.pause_shortening);
         setPauseCutoffMs(String(saved.pause_cutoff_ms));
         setPauseProtectOpening(saved.pause_protect_opening);
@@ -609,6 +618,73 @@ export function SettingsPage() {
             {/* Info */}
             <p className="text-xs text-white/30">
               Works offline. Whisper models support all languages; Parakeet is English only.
+            </p>
+          </div>
+
+          {/* Where each model runs. Two switches because the two families
+              answer differently, and one switch would have to be wrong for
+              one of them. Both take effect on the next dictation. */}
+          <div className="space-y-2">
+            <Label className="text-xs uppercase tracking-wide text-white/50">
+              Graphics card
+            </Label>
+
+            <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
+              <div className="pr-3">
+                <span className="text-sm text-white">Run Whisper on the graphics card</span>
+                <p className="text-xs text-white/40">
+                  Measured on this Mac: 3.3 seconds against 12.2 on the
+                  processor, for the same minute of speech. Leave it on.
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  const next = !whisperGpu;
+                  setWhisperGpu(next);
+                  invoke("set_whisper_gpu", { enabled: next }).catch(() => {});
+                }}
+                className={`shrink-0 w-10 h-5 rounded-full transition-colors ${
+                  whisperGpu ? "bg-green-500" : "bg-white/20"
+                }`}
+              >
+                <div
+                  className={`w-4 h-4 rounded-full bg-white transition-transform ${
+                    whisperGpu ? "translate-x-5" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
+              <div className="pr-3">
+                <span className="text-sm text-white">Run Parakeet and Moonshine on the graphics card</span>
+                <p className="text-xs text-white/40">
+                  Off, because it is slower: over a minute of speech Parakeet
+                  took 6.8 seconds against 1.9 on the processor, Moonshine 2.6
+                  against 1.7. Worth trying if your Mac is newer than an M2.
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  const next = !onnxGpu;
+                  setOnnxGpu(next);
+                  invoke("set_onnx_gpu", { enabled: next }).catch(() => {});
+                }}
+                className={`shrink-0 w-10 h-5 rounded-full transition-colors ${
+                  onnxGpu ? "bg-green-500" : "bg-white/20"
+                }`}
+              >
+                <div
+                  className={`w-4 h-4 rounded-full bg-white transition-transform ${
+                    onnxGpu ? "translate-x-5" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+
+            <p className="text-xs text-white/30">
+              Either switch takes effect on the next dictation, which loads the
+              model again and so takes a moment longer than usual.
             </p>
           </div>
 

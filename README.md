@@ -195,6 +195,36 @@ To use a different key, open **Settings** → **Dictation key** → **Change**, 
 combination you want. If it is already taken by another app it says so and keeps the old
 one, so you can never end up with no shortcut.
 
+### Which models use the graphics card
+
+**Settings** → **Graphics card**. Two switches, because the two kinds of model
+answer differently.
+
+One minute of speech, on an M2 Pro:
+
+| Model | Setting | Graphics card | Processor |
+|---|---|---|---|
+| Whisper Turbo | **on** | **3.3 s** | 12.2 s |
+| Parakeet v3 | **off** | 6.8 s | **1.9 s** |
+| Moonshine Base | **off** | 2.6 s | **1.7 s** |
+
+Whisper runs on whisper.cpp through Metal. Parakeet and Moonshine run on ONNX
+Runtime through CoreML. They are separate, so one switch cannot serve both.
+
+The reason the second one loses: those models are quantised to 8-bit integers,
+which CoreML handles poorly — it hands parts back to the processor and pays for
+the crossing each time. Loading is slower too: Parakeet takes 5.7 seconds to
+load on the graphics card against 0.6 on the processor.
+
+These numbers are from one Mac, an M2 Pro. On yours, run:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml --release -- --ignored --nocapture both_gpu_switches
+```
+
+It loads whichever model you have chosen, times it both ways, and prints which
+won. Either switch takes effect on the next dictation.
+
 The menu-bar icon has:
 
 | Item | What it does |

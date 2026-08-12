@@ -5,6 +5,43 @@ use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams};
 use transcribe_rs::onnx::Quantization;
 use transcribe_rs::whisper_cpp::{WhisperEngine, WhisperInferenceParams, WhisperLoadParams};
 
+/// Which of the two runtimes may use the GPU. Whisper runs on whisper.cpp and
+/// Metal; the rest run on ONNX Runtime and CoreML. They share nothing, so they
+/// are answered separately.
+///
+/// Read at every load, because both are decided while the model is being built
+/// and cannot be changed once it is in memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GpuChoice {
+    /// CoreML for Parakeet and Moonshine.
+    pub onnx: bool,
+    /// Metal for Whisper.
+    pub whisper: bool,
+}
+
+/// What the ONNX switch means to the transcription library. `Auto` is its own
+/// pick of the best provider, which on a Mac is CoreML.
+pub fn onnx_accelerator(gpu: bool) -> transcribe_rs::OrtAccelerator {
+    if gpu {
+        transcribe_rs::OrtAccelerator::Auto
+    } else {
+        transcribe_rs::OrtAccelerator::CpuOnly
+    }
+}
+
+/// Whether a dictation has to build the model, given what is already in memory.
+///
+/// `loaded` is the model in memory and the switches it was built with, or None
+/// when there is nothing loaded yet.
+///
+/// The switches are half of the answer, not just the name. A model already in
+/// memory was built with whichever switch was on at the time, and that cannot
+/// be changed afterwards; without checking them, moving a switch would appear
+/// to do nothing until the app was restarted or another model chosen.
+pub fn needs_load(loaded: Option<(&str, GpuChoice)>, model_id: &str, gpu: GpuChoice) -> bool {
+    loaded != Some((model_id, gpu))
+}
+
 /// Loaded transcription engine
 enum LoadedEngine {
     Whisper(WhisperEngine),
@@ -66,6 +103,8 @@ impl LoadedEngine {
 pub struct TranscriptionManager {
     loaded_engine: Option<LoadedEngine>,
     current_model_id: Option<String>,
+    /// Which runtime had the GPU when the model in memory was built.
+    loaded_with: Option<GpuChoice>,
     model_manager: Arc<ModelManager>,
 }
 
@@ -75,8 +114,18 @@ impl TranscriptionManager {
         Self {
             loaded_engine: None,
             current_model_id: None,
+            loaded_with: None,
             model_manager,
         }
+    }
+
+    /// Whether the next dictation has to build the model again.
+    pub fn needs_load(&self, model_id: &str, gpu: GpuChoice) -> bool {
+        needs_load(
+            self.current_model_id.as_deref().zip(self.loaded_with),
+            model_id,
+            gpu,
+        )
     }
 
     /// Check if a model is currently loaded
@@ -86,14 +135,19 @@ impl TranscriptionManager {
     }
 
     /// Load a model by ID
-    pub fn load_model(&mut self, model_id: &str) -> Result<(), String> {
-        // Check if already loaded
-        if self.current_model_id.as_deref() == Some(model_id) {
+    pub fn load_model(&mut self, model_id: &str, gpu: GpuChoice) -> Result<(), String> {
+        // Already in memory, and built the way the settings ask for.
+        if !self.needs_load(model_id, gpu) {
             return Ok(());
         }
 
         // Unload current model first
         self.unload_model();
+
+        // Has to be set before the model is built: each ONNX session picks its
+        // provider as it is created, and keeps it. Whisper ignores this and is
+        // told separately below.
+        transcribe_rs::set_ort_accelerator(onnx_accelerator(gpu.onnx));
 
         // Get model info
         let model_info = AVAILABLE_MODELS
@@ -119,8 +173,14 @@ impl TranscriptionManager {
                 // turn flash attention on. Flash attention was off before the
                 // transcribe-rs 0.3 upgrade and turning it on made Whisper
                 // output repeated nonsense, sometimes in the wrong language.
+                //
+                // use_gpu has to be named here. WhisperLoadParams::default()
+                // sets it to true whatever the settings say - only
+                // WhisperEngine::load reads them, and that is the call this
+                // does not use, because of the flash attention note above.
                 let params = WhisperLoadParams {
                     flash_attn: false,
+                    use_gpu: gpu.whisper,
                     ..Default::default()
                 };
                 let whisper = WhisperEngine::load_with_params(&full_path, params)
@@ -149,6 +209,13 @@ impl TranscriptionManager {
 
         self.loaded_engine = Some(engine);
         self.current_model_id = Some(model_id.to_string());
+        self.loaded_with = Some(gpu);
+        eprintln!(
+            "Loaded {} (ONNX on {}, Whisper on {})",
+            model_id,
+            if gpu.onnx { "GPU" } else { "CPU" },
+            if gpu.whisper { "GPU" } else { "CPU" },
+        );
 
         Ok(())
     }
@@ -159,6 +226,7 @@ impl TranscriptionManager {
             eprintln!("Unloading model {}", model_id);
         }
         self.loaded_engine = None;
+        self.loaded_with = None;
     }
 
     /// Transcribe 16kHz mono f32 audio. `language` None = auto-detect.
