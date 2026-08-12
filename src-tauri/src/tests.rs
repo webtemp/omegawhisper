@@ -1378,6 +1378,104 @@ fn corpus() -> Vec<(String, Vec<f32>)> {
         .collect()
 }
 
+// ---- quitting with a model still loaded --------------------------------
+//
+// Whisper keeps GPU buffers inside the loaded model. The app ends through C's
+// exit(), which runs Metal's own teardown but not Rust's, so the model has to
+// be let go first - `RunEvent::Exit` in lib.rs - or the teardown finds buffers
+// still held and aborts the process:
+//
+//   ggml-metal-device.m: GGML_ASSERT([rsets->data count] == 0) failed
+//
+// Nothing is lost when that happens, which is exactly why it needs a test:
+// take the line out of lib.rs and everything still appears to work. Only the
+// exit code changes, from 0 to 134.
+//
+// It takes two processes, because the failure is the process dying. The parent
+// runs the child below twice and compares how each one ended.
+
+// Whisper specifically: the buffers that trip the assertion are Metal's, and
+// only Whisper is on Metal.
+fn a_downloaded_whisper_model() -> Option<&'static str> {
+    let models = crate::managers::ModelManager::new().ok()?;
+    crate::managers::AVAILABLE_MODELS
+        .iter()
+        .find(|m| m.id.starts_with("whisper") && models.is_model_downloaded(m.id))
+        .map(|m| m.id)
+}
+
+#[test]
+#[ignore = "starts two more processes, one of which is meant to abort"]
+fn quitting_with_a_model_loaded_does_not_abort() {
+    let Some(_) = a_downloaded_whisper_model() else {
+        println!("no Whisper model downloaded, nothing to test");
+        return;
+    };
+    let exe = std::env::current_exe().expect("no test binary");
+
+    // (let the model go first, should the process end cleanly, why)
+    let cases: &[(&str, bool, &str)] = &[
+        (
+            "0",
+            false,
+            "a model still in memory at exit aborts - the fault this guards",
+        ),
+        ("1", true, "letting it go first is what makes exit clean"),
+    ];
+
+    for &(drop_first, want_clean, why) in cases {
+        let status = std::process::Command::new(&exe)
+            .args(["--exact", "--ignored", "--nocapture", "tests::quit_child"])
+            .env("OMEGAWHISPER_QUIT_CHILD", "1")
+            .env("OMEGAWHISPER_QUIT_DROP", drop_first)
+            .output()
+            .expect("could not start the child");
+
+        assert_eq!(
+            status.status.success(),
+            want_clean,
+            "{}: ended with {:?}",
+            why,
+            status.status
+        );
+    }
+}
+
+// The other half of the test above, and only useful when driven by it: it ends
+// its own process on purpose. Run on its own it does nothing.
+#[test]
+#[ignore = "the second half of quitting_with_a_model_loaded_does_not_abort"]
+fn quit_child() {
+    if std::env::var("OMEGAWHISPER_QUIT_CHILD").is_err() {
+        return;
+    }
+    let model_id = a_downloaded_whisper_model().expect("no Whisper model");
+    let models = Arc::new(crate::managers::ModelManager::new().expect("no model folder"));
+    let mut engine = crate::managers::TranscriptionManager::new(models);
+
+    engine
+        .load_model(
+            model_id,
+            GpuChoice {
+                onnx: false,
+                whisper: true,
+            },
+        )
+        .expect("could not load");
+
+    // Something has to run for the GPU buffers to be handed out.
+    engine
+        .transcribe(&vec![0.0f32; 16_000], None)
+        .expect("transcribe failed");
+
+    if std::env::var("OMEGAWHISPER_QUIT_DROP").as_deref() == Ok("1") {
+        engine.unload_model();
+    }
+
+    // What the tray's Quit does, and what RunEvent::Exit runs just before.
+    std::process::exit(0);
+}
+
 // The two GPU switches, timed against each other on every model on this Mac
 // and a real recording. This is what the defaults in `Prefs` are set from; run
 // it on any Mac to find out whether they are right for that machine.
