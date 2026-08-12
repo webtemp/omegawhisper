@@ -55,6 +55,32 @@ interface Settings {
   whisper_gpu: boolean;
 }
 
+// The models one graphics-card switch decides for. The ones already on this
+// Mac are brighter: those are the ones the switch changes anything for today.
+function ModelsAffected({ models }: { models: ModelInfo[] }) {
+  if (models.length === 0) return null;
+  return (
+    <p className="text-xs text-white/30 mt-1">
+      Affects:{" "}
+      {models.map((model, index) => (
+        <span key={model.id}>
+          {index > 0 && ", "}
+          <span
+            className={model.status === "downloaded" ? "text-white/60" : undefined}
+            title={
+              model.status === "downloaded"
+                ? "downloaded"
+                : "not downloaded, so nothing changes for it yet"
+            }
+          >
+            {model.name}
+          </span>
+        </span>
+      ))}
+    </p>
+  );
+}
+
 export function SettingsPage() {
   // App version
   const [appVersion, setAppVersion] = useState<string>("");
@@ -83,6 +109,11 @@ export function SettingsPage() {
   // is much faster on the GPU and the others are slower on it.
   const [onnxGpu, setOnnxGpu] = useState(false);
   const [whisperGpu, setWhisperGpu] = useState(true);
+
+  // Split the model list the same way the two switches are split: Whisper runs
+  // on whisper.cpp, everything else on ONNX Runtime.
+  const whisperModels = availableModels.filter((m) => m.engine_type === "whisper");
+  const onnxModels = availableModels.filter((m) => m.engine_type !== "whisper");
 
   // Shorten long pauses before the model reads the recording. The two lengths
   // are kept as text while being typed, so a half-typed number is not saved.
@@ -623,7 +654,11 @@ export function SettingsPage() {
 
           {/* Where each model runs. Two switches because the two families
               answer differently, and one switch would have to be wrong for
-              one of them. Both take effect on the next dictation. */}
+              one of them. Both take effect on the next dictation.
+
+              The model names under each switch come from the model list
+              itself, so a model added later appears under the right switch
+              without anyone remembering to update this. */}
           <div className="space-y-2">
             <Label className="text-xs uppercase tracking-wide text-white/50">
               Graphics card
@@ -636,6 +671,7 @@ export function SettingsPage() {
                   Measured on this Mac: 3.3 seconds against 12.2 on the
                   processor, for the same minute of speech. Leave it on.
                 </p>
+                <ModelsAffected models={whisperModels} />
               </div>
               <button
                 onClick={() => {
@@ -663,6 +699,7 @@ export function SettingsPage() {
                   took 6.8 seconds against 1.9 on the processor, Moonshine 2.6
                   against 1.7. Worth trying if your Mac is newer than an M2.
                 </p>
+                <ModelsAffected models={onnxModels} />
               </div>
               <button
                 onClick={() => {
