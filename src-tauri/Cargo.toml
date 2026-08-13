@@ -1,6 +1,6 @@
 [package]
 name = "omegawhisper"
-version = "0.3.0"
+version = "0.4.0"
 description = "The most productive local-only speech to text program."
 authors = ["Deyan Danailov <webtemp@gmail.com>", "shenoy.ameya@gmail.com"]
 edition = "2021"
@@ -35,6 +35,9 @@ transcribe-rs = { version = "0.3", features = ["onnx", "whisper-cpp"] }
 rustfft = "6"
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-clipboard-manager = "2.3.2"
+# Start the app when the computer starts. On macOS this writes
+# ~/Library/LaunchAgents/Omegawhisper.plist; nothing is asked of the user.
+tauri-plugin-autostart = "2.5.1"
 # Note: silero-vad-rs has ort version conflict with transcribe-rs, using simple energy-based VAD instead
 
 [dependencies.async-trait]

@@ -8,6 +8,7 @@ use crate::analysis::{
 };
 use crate::chime::{play_chime, START_CHIME};
 use crate::indicator::show_indicator;
+use crate::managers::GpuChoice;
 use crate::microphone::{get_input_device, get_safe_input_config};
 use crate::resampler::AudioResampler;
 use crate::storage::get_recordings_dir;
@@ -141,6 +142,11 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
     let transcription_manager = state.transcription_manager.0.clone();
 
     // Read once here: the transcription thread cannot reach the app state.
+    let gpu = GpuChoice {
+        onnx: prefs.onnx_gpu,
+        whisper: prefs.whisper_gpu,
+    };
+
     let shorten_pauses = prefs.pause_shortening.then_some(PauseRules {
         cutoff_ms: prefs.pause_cutoff_ms,
         protect_opening_ms: prefs
@@ -220,16 +226,16 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
                 }
             };
 
-            let currently_loaded = manager.get_loaded_model_id().map(|s| s.to_string());
-            if currently_loaded.as_deref() != Some(&model_id) {
-                if let Err(e) = manager.load_model(&model_id) {
-                    let _ = app_handle_ws.emit(
-                        "transcription-error",
-                        format!("Failed to load model: {}", e),
-                    );
-                    stop_recording_on_error(&is_recording_ws, &stop_signal_ws);
-                    return;
-                }
+            // load_model decides for itself whether anything has to be built:
+            // a different model, or the same one with the GPU switches moved
+            // since it was loaded.
+            if let Err(e) = manager.load_model(&model_id, gpu) {
+                let _ = app_handle_ws.emit(
+                    "transcription-error",
+                    format!("Failed to load model: {}", e),
+                );
+                stop_recording_on_error(&is_recording_ws, &stop_signal_ws);
+                return;
             }
         }
 

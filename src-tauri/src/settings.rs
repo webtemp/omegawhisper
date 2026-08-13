@@ -43,6 +43,28 @@ pub(crate) struct Prefs {
     /// is off, so turning it back on does not lose the number.
     #[serde(default = "default_pause_opening_ms")]
     pub(crate) pause_opening_ms: u32,
+    /// Run the ONNX models - Parakeet, Moonshine - on the GPU, through CoreML.
+    ///
+    /// Off by default, which is the opposite of what it sounds like it should
+    /// be. On an M2 Pro, over a minute of speech, Parakeet took 6.76 s with it
+    /// and 1.87 s without, and its load went from 0.63 s to 5.72 s. Moonshine
+    /// took 2.59 s against 1.66 s. The models are quantised to 8-bit integers,
+    /// which CoreML handles poorly - it hands parts back to the processor and
+    /// pays for the crossing each time.
+    ///
+    /// Kept as a switch rather than removed: that is one Mac, and another one,
+    /// or a later ONNX Runtime, could well be faster with it on.
+    #[serde(default)]
+    pub(crate) onnx_gpu: bool,
+    /// Run Whisper on the GPU, through Metal. A separate runtime from the one
+    /// above, and a separate switch, because the answer is the opposite: same
+    /// Mac, same minute of speech, Whisper Turbo took 3.29 s with it and
+    /// 12.21 s without. On unless it is turned off.
+    ///
+    /// `both_gpu_switches_change_where_the_model_runs` in `tests.rs` is where
+    /// all four numbers come from, and re-measures them on any Mac.
+    #[serde(default = "default_true")]
+    pub(crate) whisper_gpu: bool,
     /// Set once the settings held in the browser have been copied into here, so
     /// the copy happens exactly once and never overwrites a later change.
     #[serde(default)]
@@ -80,6 +102,8 @@ impl Default for Prefs {
             pause_cutoff_ms: default_pause_cutoff_ms(),
             pause_protect_opening: true,
             pause_opening_ms: default_pause_opening_ms(),
+            onnx_gpu: false,
+            whisper_gpu: true,
             migrated_from_browser: false,
         }
     }
@@ -233,4 +257,89 @@ pub(crate) async fn set_pause_opening_ms(
     let milliseconds = milliseconds.min(30_000);
     state.update_prefs(|p| p.pause_opening_ms = milliseconds);
     Ok(milliseconds)
+}
+
+// Start the app when the computer starts.
+//
+// This one setting is not in tray-prefs.json. The system holds it: on macOS it
+// is the file ~/Library/LaunchAgents/Omegawhisper.plist, which the user can
+// also delete from System Settings. A copy here could say "on" while the file
+// is gone, so the system is asked every time instead.
+
+#[tauri::command]
+pub(crate) fn get_start_at_login(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn set_start_at_login(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    match result {
+        Ok(()) => {
+            eprintln!("Start at login: {}", if enabled { "on" } else { "off" });
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Could not change start at login: {}", e);
+            Err(e.to_string())
+        }
+    }
+}
+
+// The saved login entry holds the full path to the app, and nothing checks
+// that the path still leads anywhere. Move the app to another folder and it
+// silently stops starting. Writing the entry again at every startup points it
+// at wherever the app is being run from now.
+//
+// Only in a release build. A `bun run tauri dev` run would otherwise point the
+// login entry at the development binary in `target/`.
+pub(crate) fn refresh_start_at_login(app: &AppHandle) {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    match manager.is_enabled() {
+        Ok(true) => {
+            if let Err(e) = manager.enable() {
+                eprintln!("Could not point start at login at this copy of the app: {}", e);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => eprintln!("Could not read start at login: {}", e),
+    }
+}
+
+// The two GPU switches. Saving is not enough on its own: a model already in
+// memory was built the old way and would go on running that way. The next
+// dictation rebuilds it, because `load_model` compares the switches against
+// the ones the loaded model was built with.
+#[tauri::command]
+pub(crate) async fn set_onnx_gpu(state: State<'_, AudioState>, enabled: bool) -> Result<(), String> {
+    state.update_prefs(|p| p.onnx_gpu = enabled);
+    eprintln!(
+        "Parakeet and Moonshine will run on the {} from the next dictation.",
+        if enabled { "GPU" } else { "processor" }
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn set_whisper_gpu(
+    state: State<'_, AudioState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.update_prefs(|p| p.whisper_gpu = enabled);
+    eprintln!(
+        "Whisper will run on the {} from the next dictation.",
+        if enabled { "GPU" } else { "processor" }
+    );
+    Ok(())
 }

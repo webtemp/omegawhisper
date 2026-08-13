@@ -269,6 +269,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Starting the app when the computer starts. LaunchAgent writes a file
+        // in ~/Library/LaunchAgents; the other choice, AppleScript, makes macOS
+        // ask the user to let Omegawhisper control System Events first.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         // Global shortcut toggles recording from anywhere.
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -301,11 +308,19 @@ pub fn run() {
             settings::set_pause_cutoff_ms,
             settings::set_pause_protect_opening,
             settings::set_pause_opening_ms,
+            settings::get_start_at_login,
+            settings::set_start_at_login,
+            settings::set_onnx_gpu,
+            settings::set_whisper_gpu,
             shortcut::get_shortcut,
             shortcut::set_shortcut,
             get_startup_warnings,
         ])
         .setup(|app| {
+            // Keep the login entry pointing at this copy of the app.
+            #[cfg(desktop)]
+            settings::refresh_start_at_login(app.handle());
+
             // The saved key toggles recording from anywhere.
             #[cfg(desktop)]
             {
@@ -605,6 +620,30 @@ pub fn run() {
             let _ = app; // Silence unused warning on non-Linux
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // Let the model go before the process ends.
+            //
+            // Quitting ends the process through C's exit(). That runs the
+            // teardown C and C++ code registered, but not Rust's, so a loaded
+            // model is never dropped. Whisper's Metal teardown is one of the C
+            // ones, and it checks that every GPU buffer it handed out has been
+            // given back. It finds the model still holding some and stops the
+            // process on the way out:
+            //   ggml-metal-device.m: GGML_ASSERT([rsets->data count] == 0) failed
+            // Nothing is lost when that happens - the text has been typed and
+            // the settings were written the moment they changed - but the exit
+            // code is wrong and the log ends in a page of addresses.
+            //
+            // Dropping the model here, while Rust is still running, is what
+            // makes that check pass. RunEvent::Exit covers every ordinary way
+            // out: the tray's Quit, and macOS asking the app to close.
+            if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                app.state::<AudioState>()
+                    .transcription_manager
+                    .unload_model();
+            }
+        });
 }
