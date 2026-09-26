@@ -1,5 +1,5 @@
 {
-  description = "Omegawhisper - Type 3x faster, without lifting a finger";
+  description = "Omegawhisper - press a key, speak, and the text is typed for you";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -49,6 +49,10 @@
           # For typing text
           wtype
           ydotool
+          # The indicator on Wayland
+          gtk-layer-shell
+          # The tray icon
+          libappindicator-gtk3
 
           # ONNX Runtime for local transcription
           onnxruntime
@@ -234,7 +238,7 @@
           '';
 
           meta = with pkgs.lib; {
-            description = "Type 3x faster, without lifting a finger";
+            description = "Press a key, speak, and the text is typed for you";
             homepage = "https://github.com/webtemp/omegawhisper";
             license = licenses.gpl3Plus;
             maintainers = [ ];

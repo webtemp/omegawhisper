@@ -3,23 +3,16 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { db } from "@/lib/audio-level";
 import { handOverBrowserSettings } from "@/lib/browser-settings";
+import { DEFAULT_VISUALISATION, visualisation, type MicLevel } from "@/components/visualisations";
 
 const BINS = 64;
 const ROWS = 30;
-const FILL_START = 8;
 
 // Everything drawn here comes from Rust, measured on the audio the recording
 // actually gets. This window must never open the microphone itself: WebKit
 // ignores the "raw stream" constraints and puts the device into processed
 // mode, and macOS then winds its gain up over the first seconds - the first
 // words of every dictation came out nearly inaudible.
-type MicLevel = {
-  peak: number;
-  rms: number;
-  seconds: number;
-  pitch: number;
-  bands: number[];
-};
 
 // What one finished dictation did. Sent once, after the model returns, and the
 // same numbers as the "dictation:" line in the log.
@@ -134,6 +127,8 @@ export function Indicator() {
   const [errorText, setErrorText] = useState<string | null>(null);
   // The drawing loop is set up once and cannot read React state.
   const errorRef = useRef(false);
+  // Which picture the drawing loop makes of the sound. Chosen in Settings.
+  const vizRef = useRef(DEFAULT_VISUALISATION);
 
   // Anything Rust found wrong at startup: a dictation key it could not
   // register, a permission it was not given. This is the only window the user
@@ -204,6 +199,20 @@ export function Indicator() {
   }, [transcribing]);
 
   useEffect(() => {
+    invoke<{ visualisation: string }>("get_settings")
+      .then((s) => {
+        vizRef.current = s.visualisation;
+      })
+      .catch(() => {});
+    const unlisten = listen<string>("visualisation-changed", (e) => {
+      vizRef.current = e.payload;
+    });
+    return () => {
+      unlisten.then((fn) => fn()).catch(() => {});
+    };
+  }, []);
+
+  useEffect(() => {
     const apply = (on: boolean) => {
       showStatsRef.current = on;
       setShowStats(on);
@@ -224,7 +233,49 @@ export function Indicator() {
     let raf = 0;
     let frame = 0;
     // Newest numbers from the recording itself; empty until the first arrives.
-    let mic: MicLevel = { peak: 0, rms: 0, seconds: 0, pitch: 0, bands: [] };
+    const quiet = (): MicLevel => ({
+      peak: 0, rms: 0, seconds: 0, pitch: 0, bands: [], pause: 0, typing: false, sentences: 0,
+      armed: false,
+    });
+    let mic: MicLevel = quiet();
+    // Live typing: a bar along the bottom fills as the pause runs towards the
+    // cut, and flashes when a sentence has gone out.
+    let sentencesSeen = 0;
+    let flashUntil = 0;
+
+    function drawLiveState(ctx: CanvasRenderingContext2D, w: number, h: number) {
+      const now = performance.now();
+      if (mic.armed && mic.sentences === 0 && !mic.typing) {
+        ctx.font = "600 11px ui-sans-serif, system-ui, sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillStyle = "rgba(150, 220, 255, 0.85)";
+        ctx.shadowColor = "rgba(0, 0, 0, 0.9)";
+        ctx.shadowBlur = 4;
+        ctx.fillText("still listening", w / 2, h - 8);
+        ctx.shadowBlur = 0;
+      }
+      if (mic.sentences > sentencesSeen) {
+        sentencesSeen = mic.sentences;
+        flashUntil = now + 450;
+      }
+      const flash = Math.max(0, (flashUntil - now) / 450);
+      if (flash > 0) {
+        ctx.fillStyle = `rgba(140, 255, 200, ${0.9 * flash})`;
+        ctx.fillRect(0, h - 3, w, 3);
+        return;
+      }
+      if (mic.typing) {
+        ctx.fillStyle = "rgba(140, 255, 200, 0.6)";
+        ctx.fillRect(0, h - 3, w, 3);
+        return;
+      }
+      if (mic.pause > 0) {
+        ctx.fillStyle = "rgba(255, 255, 255, 0.12)";
+        ctx.fillRect(0, h - 3, w, 3);
+        ctx.fillStyle = `rgba(150, 220, 255, ${0.35 + 0.55 * mic.pause})`;
+        ctx.fillRect(0, h - 3, w * mic.pause, 3);
+      }
+    }
 
     const history: number[][] = Array.from({ length: ROWS }, () =>
       new Array(BINS).fill(0)
@@ -250,14 +301,18 @@ export function Indicator() {
       const el = statsRef.current;
       if (!el || !showStatsRef.current) return;
 
+      // A quiet microphone is fine: speech is recognised by its shape and
+      // raised afterwards. Only nothing at all, or clipping, is a problem.
       let state = "ok";
       let color = "rgba(226, 248, 255, 0.75)";
       if (mic.peak > 0.98) {
         state = "TOO LOUD";
         color = "rgb(255, 138, 128)";
-      } else if (mic.rms < 0.005) {
-        state = "TOO QUIET";
+      } else if (mic.seconds > 1 && mic.peak < 0.001) {
+        state = "NO SIGNAL";
         color = "rgb(255, 196, 100)";
+      } else if (mic.rms < 0.005) {
+        state = "quiet";
       }
 
       // Every field is padded to a fixed width. Without that the numbers
@@ -300,78 +355,8 @@ export function Indicator() {
       // Every frame is unreadable; ~6 times a second is not.
       if (frame % 10 === 0) updateStats();
 
-      const originY = h * 0.9;
-      const colW = (w * 0.72) / BINS;
-      const stepX = (w * 0.24) / ROWS;
-      const stepY = (h * 0.55) / ROWS;
-      const heightScale = h * 0.24;
-
-      // Centre the whole shape in the window. Rows recede to the right, so
-      // fan them out around the middle row instead of starting every row at
-      // the same left edge - otherwise the bright front row sits well left
-      // of centre, which is obvious now that there is no panel behind it.
-      const rowSpan = colW * (BINS - 1);
-      const originX = (w - rowSpan) / 2;
-      const skew = (j: number) => (j - (ROWS - 1) / 2) * stepX;
-
-      const px = (i: number, j: number) => originX + i * colW + skew(j);
-      const py = (j: number, mag: number) => originY - j * stepY - mag * heightScale;
-
-      const crestPath = (j: number) => {
-        const row = history[j];
-        const p = new Path2D();
-        p.moveTo(px(0, j), py(j, row[0]));
-        for (let i = 1; i < BINS; i++) p.lineTo(px(i, j), py(j, row[i]));
-        return p;
-      };
-
-      for (let j = ROWS - 1; j >= 0; j--) {
-        const row = history[j];
-        const depth = 1 - j / ROWS;
-        const baselineY = originY - j * stepY;
-        const crest = crestPath(j);
-
-        if (j >= FILL_START) {
-          const body = new Path2D(crest);
-          body.lineTo(px(BINS - 1, j), baselineY);
-          body.lineTo(px(0, j), baselineY);
-          body.closePath();
-          const t = (j - FILL_START) / (ROWS - 1 - FILL_START);
-          const r = Math.round(56 + (236 - 56) * t);
-          const g = Math.round(132 + (248 - 132) * t);
-          const b = Math.round(250 + (255 - 250) * t);
-          ctx.globalAlpha = 0.32 + t * 0.3;
-          ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
-          ctx.fill(body);
-        }
-
-        ctx.globalAlpha = 0.1 + depth * 0.18;
-        ctx.strokeStyle = "rgb(90, 205, 255)";
-        ctx.lineWidth = 4;
-        ctx.stroke(crest);
-
-        ctx.globalAlpha = 0.45 + depth * 0.55;
-        ctx.strokeStyle = "rgb(226, 248, 255)";
-        ctx.lineWidth = 1.1;
-        ctx.stroke(crest);
-
-        ctx.globalAlpha = 0.3 + depth * 0.6;
-        ctx.strokeStyle = "rgb(240, 252, 255)";
-        ctx.lineWidth = 1.4;
-        const capW = colW * 1.6;
-        ctx.beginPath();
-        for (let i = 2; i < BINS - 2; i++) {
-          const m = row[i];
-          if (m > 0.32 && m >= row[i - 1] && m > row[i + 1]) {
-            const cx = px(i, j);
-            const cy = py(j, m);
-            ctx.moveTo(cx - capW / 2, cy - 4);
-            ctx.lineTo(cx + capW / 2, cy - 4);
-          }
-        }
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 1;
+      visualisation(vizRef.current).draw(ctx, w, h, history, mic, frame);
+      drawLiveState(ctx, w, h);
 
       raf = requestAnimationFrame(draw);
     }
@@ -382,7 +367,9 @@ export function Indicator() {
     // it records. Going inactive only clears what is on screen.
     const setActive = (active: boolean) => {
       if (!active) {
-        mic = { peak: 0, rms: 0, seconds: 0, pitch: 0, bands: [] };
+        mic = quiet();
+        sentencesSeen = 0;
+        flashUntil = 0;
         setTranscribing(false);
         errorRef.current = false;
         setErrorText(null);

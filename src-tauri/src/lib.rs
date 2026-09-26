@@ -1,6 +1,10 @@
 mod analysis;
 mod chime;
+mod history;
 mod indicator;
+#[cfg(target_os = "linux")]
+mod linux;
+mod live;
 mod managers;
 mod microphone;
 mod models;
@@ -11,6 +15,7 @@ mod shortcut;
 mod storage;
 mod tray;
 mod typing;
+mod vad;
 
 #[cfg(test)]
 mod tests;
@@ -30,12 +35,10 @@ use shortcut::apply_shortcut;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use storage::{
-    delete_recordings_in, get_recordings_dir, migrate_legacy_data_dir, redirect_output_to_log,
-};
+use storage::{delete_recordings_in, get_recordings_dir, open_folder, redirect_output_to_log};
 use tauri::{AppHandle, Emitter, State};
 #[cfg(desktop)]
-use tray::{tray_frames, watch_tray_icon};
+use tray::{tray_image, watch_tray_icon};
 #[cfg(target_os = "macos")]
 use typing::accessibility_granted;
 #[cfg(target_os = "linux")]
@@ -62,6 +65,18 @@ pub struct AudioState {
     // The menu-bar icon, kept so its picture can be changed while the app runs.
     #[cfg(desktop)]
     tray_icon: Arc<Mutex<Option<tauri::tray::TrayIcon<tauri::Wry>>>>,
+    // The last dictations, newest first.
+    history: Arc<Mutex<Vec<history::Transcript>>>,
+    // Set when silence ended a recording: one started before this joins the
+    // previous history entry instead of making a new one.
+    session_open_until: Arc<Mutex<Option<std::time::Instant>>>,
+    continue_session: Arc<Mutex<bool>>,
+    // Silence ended the recording and a listen for more follows: no done
+    // chime and the indicator stays.
+    resume_pending: Arc<Mutex<bool>>,
+    // The desktop's answer about the dictation key, on Wayland.
+    #[cfg(target_os = "linux")]
+    portal: linux::Portal,
 }
 
 impl AudioState {
@@ -75,6 +90,12 @@ impl AudioState {
         let mut prefs = self.prefs.lock().unwrap();
         change(&mut prefs);
         save_prefs(&prefs);
+    }
+
+    // A problem found after startup, shown on the indicator like the rest.
+    fn warn(&self, message: String) {
+        eprintln!("{}", message);
+        self.startup_warnings.lock().unwrap().push(message);
     }
 }
 
@@ -126,6 +147,13 @@ struct MicLevel {
     pitch: f32,
     // One value per frequency band, 0 to 1, for the bars the windows draw.
     bands: Vec<f32>,
+    // Live typing: how far the pause is towards the cut, whether a sentence
+    // is being typed right now, and how many have been.
+    pause: f32,
+    typing: bool,
+    sentences: u32,
+    // Listening for more after a silence stop.
+    armed: bool,
 }
 
 // What one finished local dictation did, shown on the indicator so the numbers
@@ -169,13 +197,46 @@ fn now() -> String {
     Local::now().format("%H:%M:%S%.3f").to_string()
 }
 
+// What differs between the systems, for the settings window's wording.
+#[derive(Clone, serde::Serialize)]
+struct PlatformInfo {
+    os: &'static str,
+    // The desktop holds the dictation key and its own settings change it.
+    shortcut_set_by_system: bool,
+    // What each GPU switch turns on.
+    whisper_gpu: &'static str,
+    onnx_gpu: &'static str,
+}
+
+#[tauri::command]
+fn get_platform() -> PlatformInfo {
+    #[cfg(target_os = "linux")]
+    let shortcut_set_by_system = linux::shortcut_set_by_system();
+    #[cfg(not(target_os = "linux"))]
+    let shortcut_set_by_system = false;
+    PlatformInfo {
+        os: std::env::consts::OS,
+        shortcut_set_by_system,
+        whisper_gpu: if cfg!(target_os = "macos") {
+            "Metal"
+        } else {
+            "Vulkan"
+        },
+        onnx_gpu: if cfg!(target_os = "macos") {
+            "CoreML"
+        } else {
+            ""
+        },
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(unix)]
     redirect_output_to_log();
 
-    // Rename the old data folder before any code reads or creates it.
-    migrate_legacy_data_dir();
+    #[cfg(target_os = "linux")]
+    linux::write_desktop_file();
 
     // Say at startup whether text can be typed into other apps. This is
     // granted per bundle identifier, so it is lost whenever the app is
@@ -195,6 +256,17 @@ pub fn run() {
              System Settings > Privacy & Security > Accessibility."
                 .to_string(),
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let names: Vec<&str> = typing::typing_tools().iter().map(|t| t.name).collect();
+        if names.is_empty() {
+            eprintln!("Typing into other apps: no tool found. Auto-type will do nothing.");
+            startup_warnings.push(typing::NO_TOOL_MESSAGE.to_string());
+        } else {
+            eprintln!("Typing into other apps: {}", names.join(", then "));
+        }
     }
 
     // Ask for the microphone now, not at the first F3.
@@ -263,6 +335,12 @@ pub fn run() {
         indicator_hide_at: Arc::new(Mutex::new(None)),
         #[cfg(desktop)]
         tray_icon: Arc::new(Mutex::new(None)),
+        history: Arc::new(Mutex::new(history::load_history())),
+        session_open_until: Arc::new(Mutex::new(None)),
+        continue_session: Arc::new(Mutex::new(false)),
+        resume_pending: Arc::new(Mutex::new(false)),
+        #[cfg(target_os = "linux")]
+        portal: linux::Portal::default(),
     };
 
     tauri::Builder::default()
@@ -304,40 +382,58 @@ pub fn run() {
             indicator::show_startup_warning,
             settings::get_debug_stats,
             settings::set_debug_stats,
+            settings::set_mic_boost,
+            settings::set_visualisation,
+            settings::set_language,
             settings::set_pause_shortening,
             settings::set_pause_cutoff_ms,
             settings::set_pause_protect_opening,
             settings::set_pause_opening_ms,
+            settings::set_live_typing,
+            settings::set_live_pause_ms,
+            settings::set_silence_stop,
+            settings::set_silence_stop_ms,
+            settings::set_auto_resume,
+            settings::set_auto_resume_ms,
+            settings::set_auto_enter,
+            settings::set_tidy_sentence_ends,
             settings::get_start_at_login,
             settings::set_start_at_login,
             settings::set_onnx_gpu,
             settings::set_whisper_gpu,
             shortcut::get_shortcut,
             shortcut::set_shortcut,
+            shortcut::shortcut_set_by_system,
+            shortcut::open_shortcut_settings,
             get_startup_warnings,
+            get_platform,
         ])
         .setup(|app| {
             // Keep the login entry pointing at this copy of the app.
             #[cfg(desktop)]
             settings::refresh_start_at_login(app.handle());
 
-            // The saved key toggles recording from anywhere.
+            // The saved key toggles recording from anywhere. Under Wayland
+            // the key grab cannot see it, so the desktop's portal holds the
+            // key instead.
+            #[cfg(target_os = "linux")]
+            let grab_key = !linux::shortcut_set_by_system();
+            #[cfg(not(target_os = "linux"))]
+            let grab_key = true;
+            #[cfg(target_os = "linux")]
+            if !grab_key {
+                linux::watch_portal_shortcut(app.handle().clone());
+            }
             #[cfg(desktop)]
-            {
+            if grab_key {
                 use tauri::Manager;
                 let handle = app.handle().clone();
                 let wanted = handle.state::<AudioState>().prefs().shortcut;
                 if let Err(e) = apply_shortcut(&handle, &wanted) {
-                    eprintln!("{}", e);
-                    handle
-                        .state::<AudioState>()
-                        .startup_warnings
-                        .lock()
-                        .unwrap()
-                        .push(format!(
-                            "{} The shortcut will not work until it is changed in Settings.",
-                            e
-                        ));
+                    handle.state::<AudioState>().warn(format!(
+                        "{} The shortcut will not work until it is changed in Settings.",
+                        e
+                    ));
                 }
             }
 
@@ -351,6 +447,12 @@ pub fn run() {
                 use tauri::Manager;
                 let handle = app.handle().clone();
                 app.listen_any("transcription-complete", move |_| {
+                    let resuming = std::mem::take(
+                        &mut *handle.state::<AudioState>().resume_pending.lock().unwrap(),
+                    );
+                    if resuming {
+                        return;
+                    }
                     play_chime(&DONE_CHIME);
                     // The per-dictation numbers arrive just before this, and
                     // 400 ms is not long enough to read them. Only waited for
@@ -372,65 +474,14 @@ pub fn run() {
                 });
             }
 
-            // Menu-bar tray: recordings, debug line, settings, quit.
+            // Menu-bar tray: last transcripts, recordings, debug line,
+            // settings, quit.
             #[cfg(desktop)]
             {
-                use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
                 use tauri::tray::TrayIconBuilder;
                 use tauri::Manager;
 
-                let settings_item = MenuItem::with_id(
-                    app,
-                    "open_settings_window",
-                    "Settings...",
-                    true,
-                    None::<&str>,
-                )?;
-                let recordings_open =
-                    MenuItem::with_id(app, "open_recordings", "Open Folder", true, None::<&str>)?;
-                let recordings_delete = MenuItem::with_id(
-                    app,
-                    "delete_recordings",
-                    "Delete Recordings",
-                    true,
-                    None::<&str>,
-                )?;
-                let recordings_item = Submenu::with_items(
-                    app,
-                    "Recordings",
-                    true,
-                    &[&recordings_open, &recordings_delete],
-                )?;
-
-                // Live microphone numbers on the indicator and the line under
-                // the text. Useful when a dictation goes wrong, noise the rest
-                // of the time, so it stays off until asked for.
-                let saved_debug = app.state::<AudioState>().prefs().debug_stats;
-                let debug_item = CheckMenuItem::with_id(
-                    app,
-                    "debug_stats",
-                    "Show debug stats",
-                    true,
-                    saved_debug,
-                    None::<&str>,
-                )?;
-
-                let quit_item =
-                    MenuItem::with_id(app, "quit", "Quit Omegawhisper", true, None::<&str>)?;
-                let sep = PredefinedMenuItem::separator(app)?;
-                let menu = Menu::with_items(
-                    app,
-                    &[
-                        &recordings_item,
-                        &debug_item,
-                        &settings_item,
-                        &sep,
-                        &quit_item,
-                    ],
-                )?;
-
-                *app.state::<AudioState>().debug_menu_item.lock().unwrap() =
-                    Some(debug_item.clone());
+                let menu = tray::build_menu(app.handle())?;
 
                 let mut tray = TrayIconBuilder::new()
                     .menu(&menu)
@@ -484,9 +535,7 @@ pub fn run() {
                             // nothing removes them, so make the folder reachable.
                             match get_recordings_dir() {
                                 Ok(dir) => {
-                                    if let Err(e) =
-                                        tauri_plugin_opener::open_path(&dir, None::<&str>)
-                                    {
+                                    if let Err(e) = open_folder(&dir) {
                                         eprintln!("Could not open {}: {}", dir.display(), e);
                                     }
                                 }
@@ -536,12 +585,14 @@ pub fn run() {
                             set_debug_stats_everywhere(app, now_on);
                         }
                         "quit" => app.exit(0),
-                        _ => {}
+                        id => {
+                            history::handle_history_click(app, id);
+                        }
                     });
 
                 // The idle frame. Template icon renders white on the macOS
                 // menu bar; watch_tray_icon changes the frame from here on.
-                if let Ok(icon) = tauri::image::Image::from_bytes(tray_frames()[0]) {
+                if let Some(icon) = tray_image(0) {
                     tray = tray.icon(icon).icon_as_template(true);
                 } else if let Some(icon) = app.default_window_icon().cloned() {
                     tray = tray.icon(icon).icon_as_template(true);
@@ -582,7 +633,11 @@ pub fn run() {
                 .visible(false)
                 .build()
                 {
-                    Ok(_) => {
+                    Ok(window) => {
+                        #[cfg(target_os = "linux")]
+                        linux::float_indicator(&window);
+                        #[cfg(not(target_os = "linux"))]
+                        let _ = window;
                         // Placed by position_indicator, which runs again every
                         // time the window is shown.
                         position_indicator(app.handle());

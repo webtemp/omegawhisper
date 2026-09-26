@@ -2,7 +2,7 @@
 // the model when the recording stops.
 
 use crate::analysis::{
-    audio_stats, boost_quiet_audio, chunk_level, detect_pitch, frequency_bands, holds_speech,
+    audio_stats, boost_quiet_audio, boost_samples, chunk_level, detect_pitch, frequency_bands,
     i16_to_f32, keep_recent, mix_to_mono, shorten_long_pauses, speech_level, to_wav_bytes,
     trim_quiet_edges, u16_to_f32, PauseRules, FFT_SIZE,
 };
@@ -12,7 +12,10 @@ use crate::managers::GpuChoice;
 use crate::microphone::{get_input_device, get_safe_input_config};
 use crate::resampler::AudioResampler;
 use crate::storage::get_recordings_dir;
-use crate::typing::type_text_internal;
+use crate::history::record_transcript;
+use crate::live::{LiveState, Segmenter, SharedLiveState};
+use crate::typing::{copy_to_clipboard, press_enter, type_text_internal};
+use crate::vad::{self, Heard, Silero};
 use crate::AudioState;
 use crate::{now, CompleteOnDrop, DictationStats, MicLevel, TranscriptionEvent};
 use chrono::Utc;
@@ -33,6 +36,7 @@ pub(crate) struct CaptureTargets {
     mic_recent: Arc<Mutex<Vec<f32>>>,
     audio_tx: std::sync::mpsc::Sender<Vec<f32>>,
     channels: u16,
+    boost: f32,
 }
 
 // A microphone problem the user has to be told about. Clearing the flag matters
@@ -68,7 +72,8 @@ where
                 return;
             }
             let buffer: Vec<f32> = data.iter().copied().map(to_f32).collect();
-            let buffer = mix_to_mono(buffer, targets.channels);
+            let mut buffer = mix_to_mono(buffer, targets.channels);
+            boost_samples(&mut buffer, targets.boost);
             // Store for the WAV file
             targets
                 .recorded_samples
@@ -88,6 +93,72 @@ where
     )
 }
 
+// Where the resampled audio goes while recording: the full buffer always,
+// and the sentence splitter when live typing or the silence stop is on.
+struct Intake {
+    all_audio: Vec<f32>,
+    segmenter: Option<Segmenter<Silero>>,
+    sentence_tx: Option<std::sync::mpsc::Sender<Vec<f32>>>,
+    silence_stop_ms: Option<u32>,
+    stop_asked: bool,
+    live_state: SharedLiveState,
+    // Listening after a silence stop: nothing said within this ends it.
+    armed_ms: Option<u32>,
+    auto_resume: bool,
+}
+
+impl Intake {
+    fn push(&mut self, app: &AppHandle, samples: Vec<f32>) {
+        if let Some(segmenter) = self.segmenter.as_mut() {
+            for sentence in segmenter.feed(&samples) {
+                if let Some(tx) = &self.sentence_tx {
+                    let _ = tx.send(sentence);
+                }
+            }
+            if self.sentence_tx.is_some() {
+                self.live_state.lock().unwrap().pause = segmenter.pause_progress();
+            }
+            if let Some(limit) = self.silence_stop_ms {
+                let silent = segmenter.silence_seconds();
+                let allowed = match (segmenter.heard_speech(), self.armed_ms) {
+                    (false, Some(armed)) => armed as f32 / 1000.0,
+                    (false, None) => limit as f32 / 1000.0,
+                    (true, _) => segmenter.stop_after_seconds(limit as f32 / 1000.0),
+                };
+                if !self.stop_asked && silent >= allowed {
+                    self.stop_asked = true;
+                    let resume = self.auto_resume && segmenter.heard_speech();
+                    eprintln!(
+                        "[{}] nothing said for {:.1} s (limit {:.1} s), stopping the recording{}",
+                        now(),
+                        silent,
+                        allowed,
+                        if resume { ", listening for more" } else { "" }
+                    );
+                    let state = app.state::<AudioState>();
+                    *state.session_open_until.lock().unwrap() =
+                        Some(std::time::Instant::now() + crate::history::SESSION_GAP);
+                    *state.resume_pending.lock().unwrap() = resume;
+                    // Blocking, and it must not wait for this thread.
+                    let app = app.clone();
+                    thread::spawn(move || {
+                        if let Err(e) = stop_recording_internal(&app) {
+                            eprintln!("silence stop: {}", e);
+                            return;
+                        }
+                        if resume {
+                            if let Err(e) = start_recording_internal(&app, true) {
+                                eprintln!("could not listen for more: {}", e);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        self.all_audio.extend(samples);
+    }
+}
+
 // Save the exact audio handed to the model, at 16kHz, so it can be listened
 // to afterwards. This is not the same as the saved recording: it is after
 // resampling and after voice detection has cut pieces out, which is the
@@ -104,7 +175,7 @@ pub(crate) fn save_model_input(samples: &[f32]) -> Option<PathBuf> {
 
 #[tauri::command]
 pub(crate) async fn start_recording(app_handle: AppHandle) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || start_recording_internal(&app_handle))
+    tokio::task::spawn_blocking(move || start_recording_internal(&app_handle, false))
         .await
         .map_err(|e| format!("Task join error: {}", e))?
 }
@@ -112,7 +183,9 @@ pub(crate) async fn start_recording(app_handle: AppHandle) -> Result<(), String>
 // The whole of starting a recording, as a plain function, so the dictation key
 // can call it as directly as the button does. Blocking: it opens the
 // microphone, so it must never run on the thread that draws the screen.
-pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), String> {
+// `armed`: started by the app after a silence stop, to hear whether the
+// speaker goes on. Quiet if nothing comes.
+pub(crate) fn start_recording_internal(app_handle: &AppHandle, armed: bool) -> Result<(), String> {
     let state = app_handle.state::<AudioState>();
     let app_handle = app_handle.clone();
 
@@ -123,9 +196,27 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
             return Err("Already recording".to_string());
         }
     }
-    eprintln!("[{}] recording started", now());
+    eprintln!(
+        "[{}] {}",
+        now(),
+        if armed { "listening for more" } else { "recording started" }
+    );
+
+    // Picked up again soon after silence ended the last one: same session.
+    let continues = armed
+        || state
+            .session_open_until
+            .lock()
+            .unwrap()
+            .take()
+            .is_some_and(|until| std::time::Instant::now() < until);
+    *state.continue_session.lock().unwrap() = continues;
 
     let prefs = state.prefs();
+    let auto_resume = prefs.auto_resume;
+    let armed_ms = armed.then_some(prefs.auto_resume_ms);
+    let auto_enter = prefs.auto_enter;
+    let tidy = prefs.tidy_sentence_ends;
 
     let model_id = prefs
         .active_local_model_id
@@ -147,6 +238,10 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
         whisper: prefs.whisper_gpu,
     };
 
+    let language = crate::settings::whisper_language(&prefs.language);
+    let live_typing = prefs.live_typing;
+    let live_pause_ms = prefs.live_pause_ms;
+    let silence_stop_ms = prefs.silence_stop.then_some(prefs.silence_stop_ms);
     let shorten_pauses = prefs.pause_shortening.then_some(PauseRules {
         cutoff_ms: prefs.pause_cutoff_ms,
         protect_opening_ms: prefs
@@ -158,6 +253,10 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
     state.recorded_samples.lock().unwrap().clear();
 
     let device = get_input_device(prefs.selected_microphone.as_deref())?;
+    let mic_boost = prefs.mic_boost;
+    if mic_boost != 1.0 {
+        eprintln!("microphone boost: {}x", mic_boost);
+    }
     let config = get_safe_input_config(&device)?;
 
     let sample_format = config.sample_format();
@@ -195,8 +294,15 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
     // Channel for sending audio chunks to transcription thread
     let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<f32>>();
 
+    // What the indicator shows about live typing.
+    let live_state: SharedLiveState = Arc::new(Mutex::new(LiveState {
+        armed,
+        ..LiveState::default()
+    }));
+
     // Everything is recorded first and transcribed once the recording stops,
     // which is why the app looks frozen for a moment afterwards.
+    let live_state_ws = live_state.clone();
     let app_handle_ws = app_handle.clone();
     let is_recording_ws = is_recording_arc.clone();
     let stop_signal_ws = state.stop_signal.clone();
@@ -252,8 +358,45 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
             }
         };
 
-        // Buffer for accumulating all audio (transcribe on stop mode)
-        let mut all_audio: Vec<f32> = Vec::new();
+        // The sentence splitter listens along when a sentence is to be typed
+        // as soon as it ends, or when silence is to end the recording. If the
+        // detector cannot load, both fall back to the plain recording.
+        let segmenter = if live_typing || silence_stop_ms.is_some() {
+            match Silero::new() {
+                Ok(detector) => Some(Segmenter::new(detector, live_pause_ms)),
+                Err(e) => {
+                    eprintln!("{} The text will be typed when the recording stops.", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let live = live_typing && segmenter.is_some();
+
+        // Sentences go to their own thread, so a slow model run never holds
+        // up the audio coming in. The channel keeps them in order.
+        let (sentence_tx, sentence_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let sentence_thread = live.then(|| {
+            let app = app_handle_ws.clone();
+            let manager = transcription_manager.clone();
+            let language = language.clone();
+            let live_state = live_state_ws.clone();
+            thread::spawn(move || {
+                crate::live::type_sentences(app, manager, language, sentence_rx, live_state, tidy)
+            })
+        });
+
+        let mut intake = Intake {
+            all_audio: Vec::new(),
+            segmenter,
+            sentence_tx: live.then_some(sentence_tx),
+            silence_stop_ms,
+            stop_asked: false,
+            live_state: live_state_ws,
+            armed_ms,
+            auto_resume,
+        };
 
         loop {
             // Check if we should stop
@@ -266,7 +409,7 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
                 Ok(samples) => {
                     // Resample to 16kHz
                     if let Ok(resampled) = resampler.process(&samples) {
-                        all_audio.extend(resampled);
+                        intake.push(&app_handle_ws, resampled);
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -287,7 +430,7 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
         // would never reach the model.
         while let Ok(samples) = audio_rx.try_recv() {
             if let Ok(resampled) = resampler.process(&samples) {
-                all_audio.extend(resampled);
+                intake.push(&app_handle_ws, resampled);
             }
         }
 
@@ -297,7 +440,123 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
 
         // Flush resampler
         if let Ok(final_samples) = resampler.flush() {
-            all_audio.extend(final_samples);
+            intake.push(&app_handle_ws, final_samples);
+        }
+
+        let Intake {
+            mut all_audio,
+            segmenter,
+            sentence_tx,
+            ..
+        } = intake;
+
+        // Enter goes only when the dictation is really over: not before a
+        // listen for more, and after one that heard nothing.
+        let send_enter = {
+            let app = app_handle_ws.clone();
+            move |typed_now: bool| {
+                let resuming = *app.state::<AudioState>().resume_pending.lock().unwrap();
+                if auto_enter && !resuming && (typed_now || armed) {
+                    match press_enter(&app) {
+                        Ok(()) => eprintln!("Enter pressed"),
+                        Err(e) => eprintln!("{}", e),
+                    }
+                }
+            }
+        };
+
+        // Live typing: the last sentence goes out, then the sentence thread
+        // is waited for, and what it typed is reported as one dictation.
+        if let Some(sentence_thread) = sentence_thread {
+            let audio_seconds = all_audio.len() as f32 / 16_000.0;
+            if let Some(last) = segmenter.and_then(|s| s.finish()) {
+                if let Some(tx) = &sentence_tx {
+                    let _ = tx.send(last);
+                }
+            }
+            drop(sentence_tx);
+            let outcome = match sentence_thread.join() {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    let _ = app_handle_ws.emit(
+                        "transcription-error",
+                        "The sentence thread crashed. Whatever was typed before that stands."
+                            .to_string(),
+                    );
+                    return;
+                }
+            };
+            let text = outcome.text();
+            let model_id = transcription_manager
+                .lock()
+                .ok()
+                .and_then(|m| m.get_loaded_model_id().map(|s| s.to_string()))
+                .unwrap_or_else(|| "none".to_string());
+            let heard = outcome.audio.len() as f32 / 16_000.0;
+            let saved_input = (!outcome.audio.is_empty()).then(|| save_model_input(&outcome.audio));
+            eprintln!(
+                "[{}] dictation: model={} audio={:.1}s sentences={} heard={:.1}s took={:.1}s chars={}",
+                now(),
+                model_id,
+                audio_seconds,
+                outcome.texts.len(),
+                heard,
+                outcome.took,
+                text.chars().count()
+            );
+            if let Some(Some(path)) = saved_input {
+                eprintln!("  what the model heard: {}", path.display());
+            }
+            let _ = app_handle_ws.emit(
+                "dictation-stats",
+                DictationStats {
+                    model: model_id,
+                    seconds: heard,
+                    trimmed: (audio_seconds - heard).max(0.0),
+                    shortened: 0.0,
+                    level_before: speech_level(&all_audio),
+                    level_after: speech_level(&outcome.audio),
+                    gain: 1.0,
+                    took: outcome.took,
+                    chars: text.chars().count(),
+                },
+            );
+            if text.is_empty() {
+                if !armed {
+                    let _ = app_handle_ws.emit(
+                        "transcription-error",
+                        format!(
+                            "These {:.0} seconds held no speech, so nothing was typed.",
+                            audio_seconds
+                        ),
+                    );
+                }
+                send_enter(false);
+                return;
+            }
+            record_transcript(&app_handle_ws, &text);
+            if outcome.typing_failed.is_none() {
+                send_enter(true);
+            }
+            if let Some(e) = outcome.typing_failed {
+                let message = match copy_to_clipboard(&app_handle_ws, &text) {
+                    Ok(()) => format!(
+                        "{} The whole text is on the clipboard - press {}+V to paste it.",
+                        e,
+                        if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" }
+                    ),
+                    Err(clip) => format!("{} The clipboard could not be used either ({}).", e, clip),
+                };
+                let _ = app_handle_ws.emit("transcription-error", message);
+            }
+            let _ = app_handle_ws.emit(
+                "transcription",
+                TranscriptionEvent {
+                    text,
+                    is_final: true,
+                },
+            );
+            return;
         }
 
         // Transcribe all accumulated audio at once
@@ -309,15 +568,46 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
             let (peak, rms, silence) = audio_stats(&all_audio);
             let level_before = speech_level(&all_audio);
 
-            // Whisper does not return nothing when it is given silence -
-            // it invents sentences, sometimes in a language nobody spoke,
-            // and auto-type puts them straight into whatever app is in
-            // front. So silence never reaches the model.
-            if !holds_speech(level_before, peak) {
+            // Silence makes Whisper invent sentences, so it never reaches
+            // the model. Silero decides from the shape of the sound.
+            let skipped = match vad::judge(&all_audio, peak, level_before) {
+                Heard::Speech(Some(seconds)) => {
+                    eprintln!(
+                        "speech detector: {:.1}s of speech in {:.1}s",
+                        seconds, audio_seconds
+                    );
+                    None
+                }
+                Heard::Speech(None) => None,
+                Heard::Dead => Some((
+                    "the microphone delivered nothing",
+                    format!(
+                        "The microphone delivered nothing at all for these {:.0} seconds. \
+                         Another app may be holding it (Teams, Zoom), or it is muted in the \
+                         system's sound settings.",
+                        audio_seconds
+                    ),
+                )),
+                Heard::Silent => Some((
+                    "no speech in it",
+                    format!(
+                        "These {:.0} seconds held no speech, so nothing was typed. If you \
+                         were speaking, the microphone is barely reaching the app: turn up \
+                         Boost under Settings > Microphone, or the input volume in the \
+                         system's sound settings.",
+                        audio_seconds
+                    ),
+                )),
+            };
+            if let Some((why, message)) = skipped {
                 eprintln!(
-                    "dictation: skipped {:.1}s, no speech in it (speech={:.4} peak={:.3})",
-                    audio_seconds, level_before, peak
+                    "dictation: skipped {:.1}s, {} (speech={:.4} peak={:.3})",
+                    audio_seconds, why, level_before, peak
                 );
+                if armed {
+                    send_enter(false);
+                    return;
+                }
                 let _ = app_handle_ws.emit(
                     "dictation-stats",
                     DictationStats {
@@ -332,28 +622,21 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
                         chars: 0,
                     },
                 );
-                let _ = app_handle_ws.emit(
-                    "transcription-error",
-                    format!(
-                        "These {:.0} seconds held no speech, so nothing was typed. If you \
-                         were speaking, the microphone is not reaching the app: check the \
-                         input volume in System Settings > Sound > Input and close other \
-                         apps holding the microphone (Teams, Zoom).",
-                        audio_seconds
-                    ),
-                );
+                let _ = app_handle_ws.emit("transcription-error", message);
                 return;
             }
 
-            // Drop the quiet head and tail, shorten the long pauses left in
-            // the middle if that is switched on, then raise the level, then
-            // save, so the saved file is exactly what the model was given.
+            // Raise the level first, so the trimming below sees a normal
+            // recording whatever the microphone's gain was. Then drop the
+            // quiet head and tail, shorten the long pauses left in the middle
+            // if that is switched on, and save, so the saved file is exactly
+            // what the model was given.
+            let gain = boost_quiet_audio(&mut all_audio);
             let trimmed = trim_quiet_edges(&mut all_audio);
             let shortened = match shorten_pauses {
                 Some(rules) => shorten_long_pauses(&mut all_audio, rules),
                 None => 0.0,
             };
-            let gain = boost_quiet_audio(&mut all_audio);
             let level_after = speech_level(&all_audio);
             let saved_input = save_model_input(&all_audio);
 
@@ -362,7 +645,7 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
             let (result, model_id) = match transcription_manager.lock() {
                 Ok(mut manager) => {
                     let id = manager.get_loaded_model_id().unwrap_or("none").to_string();
-                    let r = manager.transcribe(&all_audio, None);
+                    let r = manager.transcribe(&all_audio, language.clone());
                     (r, id)
                 }
                 Err(e) => {
@@ -430,10 +713,10 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
                 let _ = app_handle_ws.emit(
                     "transcription-error",
                     format!(
-                        "The microphone was almost silent for these {:.0} seconds, so most \
-                         of the speech could not be read. Check the input volume in System \
-                         Settings > Sound > Input, speak closer to the microphone, and close \
-                         other apps holding the microphone (Teams, Zoom).",
+                        "The microphone was almost silent for these {:.0} seconds, so some \
+                         of the speech may have been lost. Turn up Boost under Settings > \
+                         Microphone, or the input volume in the system's sound settings, and \
+                         speak closer to the microphone.",
                         audio_seconds
                     ),
                 );
@@ -441,7 +724,11 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
 
             match result {
                 Ok(text) => {
-                    let text = text.trim().to_string();
+                    let text = if tidy {
+                        crate::live::tidy_end(text.trim())
+                    } else {
+                        text.trim().to_string()
+                    };
                     if text.is_empty() {
                         eprintln!("Transcription returned no text; nothing to type.");
                     }
@@ -451,17 +738,24 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
                             text.chars().count(),
                             text
                         );
-                        if let Err(e) = type_text_internal(&format!("{} ", text)) {
+                        // Kept before typing, so a dictation that lands in
+                        // the wrong window can be fetched back from the tray.
+                        record_transcript(&app_handle_ws, &text);
+                        if let Err(e) = type_text_internal(&app_handle_ws, &format!("{} ", text)) {
                             eprintln!("Auto-type failed: {}", e);
                             // A minute of speech must never end up nowhere.
                             // Done here rather than in a window: the window
                             // that used to do it is normally hidden, and the
                             // browser refuses the clipboard without focus.
-                            use tauri_plugin_clipboard_manager::ClipboardExt;
-                            let message = match app_handle_ws.clipboard().write_text(&*text) {
+                            let message = match copy_to_clipboard(&app_handle_ws, &text) {
                                 Ok(()) => format!(
-                                    "{} The text is on the clipboard - press Cmd+V to paste it.",
-                                    e
+                                    "{} The text is on the clipboard - press {}+V to paste it.",
+                                    e,
+                                    if cfg!(target_os = "macos") {
+                                        "Cmd"
+                                    } else {
+                                        "Ctrl"
+                                    }
                                 ),
                                 Err(clip) => {
                                     eprintln!("Clipboard also failed: {}", clip);
@@ -475,6 +769,7 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
                             is_final: true,
                         };
                         let _ = app_handle_ws.emit("transcription", event);
+                        send_enter(true);
                     }
                 }
                 Err(e) => {
@@ -500,6 +795,7 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
         let mic_level = mic_level.clone();
         let mic_recent = mic_recent.clone();
         let is_recording = is_recording_arc.clone();
+        let live_state = live_state.clone();
         let app_handle_level = app_handle.clone();
         thread::spawn(move || {
             let mut planner = rustfft::FftPlanner::<f32>::new();
@@ -507,19 +803,28 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
             let started = std::time::Instant::now();
             let mut tick = 0u32;
             let mut pitch = 0.0f32;
+            // The loudest the microphone has been lately, falling slowly. The
+            // bars are drawn from the sound scaled against it, so a quiet
+            // microphone fills the window as a loud one does. The numbers
+            // on the debug line stay raw: they are there to show the truth.
+            let mut loudest = 0.0f32;
 
             while *is_recording.lock().unwrap() {
                 let (peak, rms) = *mic_level.lock().unwrap();
                 let recent = mic_recent.lock().unwrap().clone();
 
-                let bands = frequency_bands(&recent, &fft);
+                loudest = (loudest * 0.98).max(peak).max(0.005);
+                let display_gain = (0.8 / loudest).min(100.0);
+                let scaled: Vec<f32> = recent.iter().map(|s| s * display_gain).collect();
+                let bands = frequency_bands(&scaled, &fft, sample_rate);
                 // Pitch costs more than the rest put together, so it runs 5
                 // times a second rather than 20.
                 if tick.is_multiple_of(4) {
-                    pitch = detect_pitch(&recent, sample_rate);
+                    pitch = detect_pitch(&scaled, sample_rate);
                 }
                 tick += 1;
 
+                let live = *live_state.lock().unwrap();
                 let _ = app_handle_level.emit(
                     "mic-level",
                     MicLevel {
@@ -528,6 +833,10 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
                         seconds: started.elapsed().as_secs_f32(),
                         pitch,
                         bands,
+                        pause: live.pause,
+                        typing: live.typing,
+                        sentences: live.sentences,
+                        armed: live.armed,
                     },
                 );
                 thread::sleep(Duration::from_millis(50));
@@ -568,6 +877,7 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
             mic_recent: mic_recent.clone(),
             audio_tx: audio_tx.clone(),
             channels,
+            boost: mic_boost,
         };
         let stream_result = match sample_format {
             SampleFormat::F32 => {
@@ -613,7 +923,9 @@ pub(crate) fn start_recording_internal(app_handle: &AppHandle) -> Result<(), Str
     // On screen and audible only once the recording is really going, so a
     // failure above is never announced as a success.
     show_indicator(&app_handle);
-    play_chime(&START_CHIME);
+    if !armed {
+        play_chime(&START_CHIME);
+    }
 
     Ok(())
 }
@@ -683,7 +995,7 @@ pub(crate) fn toggle_recording(app: &AppHandle) {
         let result = if recording {
             stop_recording_internal(&app)
         } else {
-            start_recording_internal(&app)
+            start_recording_internal(&app, false)
         };
         // Said where it can be seen. A key that quietly does nothing is the
         // whole reason this moved out of a hidden window.

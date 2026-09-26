@@ -47,14 +47,35 @@ enum LoadedEngine {
 
 // Whisper writes in whichever style it starts in, so long recordings often come
 // back with no capitals and no punctuation. It copies the style of this text
-// instead. Whisper reads it as background and never types it out.
+// instead, and reads it as background it never types out.
 //
 // Deliberately about nothing: any subject in here becomes words Whisper expects
-// to hear, and it would start finding them in unrelated speech.
-const STYLE_PROMPT: &str = "Hello. This is an ordinary sentence, written the \
-     normal way, with commas where they belong and a full stop at the end. On \
-     Monday I told Maria that the work would be done by January. Do you see \
-     how it reads? Yes, exactly like that.";
+// to hear. And only in the language chosen: Whisper also keeps to the language
+// of its prompt, so an English prompt turned Bulgarian speech into English.
+// With the language left to detection there is no prompt.
+const STYLE_PROMPTS: [(&str, &str); 2] = [
+    (
+        "en",
+        "Hello. This is an ordinary sentence, written the normal way, with commas \
+         where they belong and a full stop at the end. On Monday I told Maria that \
+         the work would be done by January. Do you see how it reads? Yes, exactly \
+         like that.",
+    ),
+    (
+        "bg",
+        "Здравей. Това е обикновено изречение, написано по нормалния начин, със \
+         запетаи, където им е мястото, и точка в края. В понеделник казах на Мария, \
+         че работата ще бъде готова до януари. Виждаш ли как се чете? Да, точно така.",
+    ),
+];
+
+pub fn style_prompt(language: Option<&str>) -> Option<String> {
+    let language = language?;
+    STYLE_PROMPTS
+        .iter()
+        .find(|(code, _)| *code == language)
+        .map(|(_, prompt)| prompt.to_string())
+}
 
 impl LoadedEngine {
     /// Transcribe audio samples (expects 16kHz mono f32 audio).
@@ -69,9 +90,9 @@ impl LoadedEngine {
                 // loses most windows, which is why a long dictation came back
                 // as only its last few sentences, or as nothing at all.
                 let params = WhisperInferenceParams {
+                    initial_prompt: style_prompt(language.as_deref()),
                     language,
                     no_speech_thold: 0.6,
-                    initial_prompt: Some(STYLE_PROMPT.to_string()),
                     ..Default::default()
                 };
                 engine
