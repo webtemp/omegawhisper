@@ -26,10 +26,21 @@ pub(crate) struct Prefs {
     /// None means whichever one the system has set as default.
     #[serde(default)]
     pub(crate) selected_microphone: Option<String>,
+    /// Multiply the microphone's signal by this before anything looks at it,
+    /// 0.5 to 100. 1 leaves it alone. For a microphone so quiet that the speech
+    /// check throws the recording away, or one so hot that it clips.
+    #[serde(default = "default_mic_boost")]
+    pub(crate) mic_boost: f32,
+    /// How the indicator draws the sound. One of `VISUALISATIONS`.
+    #[serde(default = "default_visualisation")]
+    pub(crate) visualisation: String,
+    /// The language spoken, as a Whisper code, or "auto" to let it decide.
+    #[serde(default = "default_language")]
+    pub(crate) language: String,
     /// Shorten long pauses in the middle of a recording before the model reads
-    /// it. Off by default: it changes what the model hears, and the time it
-    /// saves is under a second.
-    #[serde(default)]
+    /// it. On by default, with a cutoff long enough to leave the breaths
+    /// between sentences alone.
+    #[serde(default = "default_true")]
     pub(crate) pause_shortening: bool,
     /// How long a pause has to be before any of it is removed.
     #[serde(default = "default_pause_cutoff_ms")]
@@ -43,6 +54,30 @@ pub(crate) struct Prefs {
     /// is off, so turning it back on does not lose the number.
     #[serde(default = "default_pause_opening_ms")]
     pub(crate) pause_opening_ms: u32,
+    /// Type each sentence the moment the pause after it is heard, instead of
+    /// the whole text once the recording stops.
+    #[serde(default = "default_true")]
+    pub(crate) live_typing: bool,
+    /// How long a pause has to be to end a sentence.
+    #[serde(default = "default_live_pause_ms")]
+    pub(crate) live_pause_ms: u32,
+    /// End the recording by itself once nothing has been said for a while.
+    #[serde(default = "default_true")]
+    pub(crate) silence_stop: bool,
+    #[serde(default = "default_silence_stop_ms")]
+    pub(crate) silence_stop_ms: u32,
+    /// After a silence stop, keep listening a moment: speech carries on the
+    /// same dictation without the key.
+    #[serde(default)]
+    pub(crate) auto_resume: bool,
+    #[serde(default = "default_auto_resume_ms")]
+    pub(crate) auto_resume_ms: u32,
+    /// Press Enter in the target app once the dictation is over and typed.
+    #[serde(default)]
+    pub(crate) auto_enter: bool,
+    /// Drop the "uh, uh..." the model writes when a piece ends mid-thought.
+    #[serde(default = "default_true")]
+    pub(crate) tidy_sentence_ends: bool,
     /// Run the ONNX models - Parakeet, Moonshine - on the GPU, through CoreML.
     ///
     /// Off by default, which is the opposite of what it sounds like it should
@@ -75,16 +110,76 @@ pub(crate) fn default_shortcut() -> String {
     "F3".to_string()
 }
 
+pub(crate) fn default_mic_boost() -> f32 {
+    1.0
+}
+
+// The pictures the indicator can draw. The drawing is in
+// src/components/visualisations.ts; this list is what the setting may hold.
+pub(crate) const VISUALISATIONS: [&str; 6] =
+    ["waterfall", "bars", "mirror", "ring", "dots", "curve"];
+
+pub(crate) fn default_visualisation() -> String {
+    VISUALISATIONS[0].to_string()
+}
+
+// Whisper language codes the settings window offers. "auto" is detection.
+pub(crate) const LANGUAGES: [(&str, &str); 9] = [
+    ("auto", "As spoken"),
+    ("en", "English"),
+    ("bg", "Bulgarian"),
+    ("de", "German"),
+    ("fr", "French"),
+    ("es", "Spanish"),
+    ("it", "Italian"),
+    ("pt", "Portuguese"),
+    ("ru", "Russian"),
+];
+
+pub(crate) fn default_language() -> String {
+    "auto".to_string()
+}
+
+// What the model is told, None meaning it decides.
+pub(crate) fn whisper_language(setting: &str) -> Option<String> {
+    (setting != "auto" && LANGUAGES.iter().any(|(code, _)| *code == setting))
+        .then(|| setting.to_string())
+}
+
+// Half to a hundred times, in tenths.
+pub(crate) fn clamp_mic_boost(boost: f32) -> f32 {
+    if boost.is_finite() {
+        (boost.clamp(0.5, 100.0) * 10.0).round() / 10.0
+    } else {
+        1.0
+    }
+}
+
 // 2.2 seconds. Shorter than this and it starts editing the breaths between
 // sentences, which is where Whisper gets its full stops from.
 pub(crate) fn default_pause_cutoff_ms() -> u32 {
     2200
 }
 
-// 3 seconds: long enough to cover the first sentence, which is what Whisper
+// 1.5 seconds: enough to cover the first words, which is what Whisper
 // settles the language and the writing style from.
 pub(crate) fn default_pause_opening_ms() -> u32 {
-    3000
+    1500
+}
+
+// 0.7 s: the breath between two sentences, not the one between two words.
+pub(crate) fn default_live_pause_ms() -> u32 {
+    700
+}
+
+// 3.5 seconds without a word before the recording ends by itself.
+pub(crate) fn default_silence_stop_ms() -> u32 {
+    3500
+}
+
+// 6 seconds of listening after a silence stop.
+pub(crate) fn default_auto_resume_ms() -> u32 {
+    6000
 }
 
 fn default_true() -> bool {
@@ -98,10 +193,21 @@ impl Default for Prefs {
             shortcut: default_shortcut(),
             active_local_model_id: None,
             selected_microphone: None,
-            pause_shortening: false,
+            mic_boost: default_mic_boost(),
+            visualisation: default_visualisation(),
+            language: default_language(),
+            pause_shortening: true,
             pause_cutoff_ms: default_pause_cutoff_ms(),
             pause_protect_opening: true,
             pause_opening_ms: default_pause_opening_ms(),
+            live_typing: true,
+            live_pause_ms: default_live_pause_ms(),
+            silence_stop: true,
+            silence_stop_ms: default_silence_stop_ms(),
+            auto_resume: false,
+            auto_resume_ms: default_auto_resume_ms(),
+            auto_enter: false,
+            tidy_sentence_ends: true,
             onnx_gpu: false,
             whisper_gpu: true,
             migrated_from_browser: false,
@@ -216,6 +322,37 @@ pub(crate) fn get_debug_stats(state: State<'_, AudioState>) -> bool {
     state.prefs().debug_stats
 }
 
+// The indicator hears about it at once, so the change shows on the next
+// dictation without reopening anything.
+#[tauri::command]
+pub(crate) async fn set_visualisation(app: AppHandle, name: String) -> Result<(), String> {
+    if !VISUALISATIONS.contains(&name.as_str()) {
+        return Err(format!("\"{}\" is not a visualisation.", name));
+    }
+    app.state::<AudioState>()
+        .update_prefs(|p| p.visualisation = name.clone());
+    let _ = app.emit("visualisation-changed", name);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn set_language(state: State<'_, AudioState>, code: String) -> Result<(), String> {
+    if !LANGUAGES.iter().any(|(c, _)| *c == code) {
+        return Err(format!("\"{}\" is not a language this app offers.", code));
+    }
+    state.update_prefs(|p| p.language = code);
+    Ok(())
+}
+
+// Takes effect at the next recording: the running capture reads it once.
+#[tauri::command]
+pub(crate) async fn set_mic_boost(state: State<'_, AudioState>, boost: f32) -> Result<f32, String> {
+    let boost = clamp_mic_boost(boost);
+    state.update_prefs(|p| p.mic_boost = boost);
+    eprintln!("Microphone boost: {}x", boost);
+    Ok(boost)
+}
+
 // The three pause-shortening settings. Async so writing the settings file
 // cannot freeze the window.
 #[tauri::command]
@@ -257,6 +394,83 @@ pub(crate) async fn set_pause_opening_ms(
     let milliseconds = milliseconds.min(30_000);
     state.update_prefs(|p| p.pause_opening_ms = milliseconds);
     Ok(milliseconds)
+}
+
+// Live typing and the silence stop. The limits are the window's again, for a
+// file edited by hand.
+#[tauri::command]
+pub(crate) async fn set_live_typing(
+    state: State<'_, AudioState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.update_prefs(|p| p.live_typing = enabled);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn set_live_pause_ms(
+    state: State<'_, AudioState>,
+    milliseconds: u32,
+) -> Result<u32, String> {
+    let milliseconds = milliseconds.clamp(300, 10_000);
+    state.update_prefs(|p| p.live_pause_ms = milliseconds);
+    Ok(milliseconds)
+}
+
+#[tauri::command]
+pub(crate) async fn set_silence_stop(
+    state: State<'_, AudioState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.update_prefs(|p| p.silence_stop = enabled);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn set_silence_stop_ms(
+    state: State<'_, AudioState>,
+    milliseconds: u32,
+) -> Result<u32, String> {
+    let milliseconds = milliseconds.clamp(1000, 60_000);
+    state.update_prefs(|p| p.silence_stop_ms = milliseconds);
+    Ok(milliseconds)
+}
+
+#[tauri::command]
+pub(crate) async fn set_auto_resume(
+    state: State<'_, AudioState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.update_prefs(|p| p.auto_resume = enabled);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn set_auto_resume_ms(
+    state: State<'_, AudioState>,
+    milliseconds: u32,
+) -> Result<u32, String> {
+    let milliseconds = milliseconds.clamp(1000, 30_000);
+    state.update_prefs(|p| p.auto_resume_ms = milliseconds);
+    Ok(milliseconds)
+}
+
+#[tauri::command]
+pub(crate) async fn set_auto_enter(
+    state: State<'_, AudioState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.update_prefs(|p| p.auto_enter = enabled);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn set_tidy_sentence_ends(
+    state: State<'_, AudioState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.update_prefs(|p| p.tidy_sentence_ends = enabled);
+    Ok(())
 }
 
 // Start the app when the computer starts.
@@ -309,7 +523,10 @@ pub(crate) fn refresh_start_at_login(app: &AppHandle) {
     match manager.is_enabled() {
         Ok(true) => {
             if let Err(e) = manager.enable() {
-                eprintln!("Could not point start at login at this copy of the app: {}", e);
+                eprintln!(
+                    "Could not point start at login at this copy of the app: {}",
+                    e
+                );
             }
         }
         Ok(false) => {}
@@ -322,7 +539,10 @@ pub(crate) fn refresh_start_at_login(app: &AppHandle) {
 // dictation rebuilds it, because `load_model` compares the switches against
 // the ones the loaded model was built with.
 #[tauri::command]
-pub(crate) async fn set_onnx_gpu(state: State<'_, AudioState>, enabled: bool) -> Result<(), String> {
+pub(crate) async fn set_onnx_gpu(
+    state: State<'_, AudioState>,
+    enabled: bool,
+) -> Result<(), String> {
     state.update_prefs(|p| p.onnx_gpu = enabled);
     eprintln!(
         "Parakeet and Moonshine will run on the {} from the next dictation.",

@@ -33,9 +33,36 @@ pub(crate) fn apply_shortcut(app: &AppHandle, accelerator: &str) -> Result<(), S
     Ok(())
 }
 
+// On Wayland the desktop holds the key, so its answer is shown when it has
+// given one.
 #[tauri::command]
 pub(crate) fn get_shortcut(state: State<'_, AudioState>) -> String {
+    #[cfg(target_os = "linux")]
+    if let Some(trigger) = state.portal.trigger.lock().unwrap().clone() {
+        return trigger;
+    }
     state.prefs().shortcut
+}
+
+// Whether the key is changed in the desktop's own settings rather than here.
+#[tauri::command]
+pub(crate) fn shortcut_set_by_system() -> bool {
+    #[cfg(target_os = "linux")]
+    return crate::linux::shortcut_set_by_system();
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+// Opens the desktop's page for this app's shortcut, where it can be changed.
+#[tauri::command]
+pub(crate) fn open_shortcut_settings(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    return crate::linux::open_shortcut_settings(&app);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app;
+        Err("The dictation key is changed in this window.".to_string())
+    }
 }
 
 #[tauri::command]
@@ -43,6 +70,11 @@ pub(crate) fn set_shortcut(app: AppHandle, accelerator: String) -> Result<(), St
     let accelerator = accelerator.trim().to_string();
     if accelerator.is_empty() {
         return Err("No key was chosen.".to_string());
+    }
+    if shortcut_set_by_system() {
+        return Err(
+            "The desktop holds the dictation key. Change it in its shortcut settings.".to_string(),
+        );
     }
     apply_shortcut(&app, &accelerator)?;
 

@@ -59,6 +59,18 @@ impl ModelInfo {
                 url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin",
                 size_bytes: 1_080_000_000,
             }],
+            "whisper-large-full" => vec![ModelFile {
+                filename: "ggml-large-v3.bin",
+                url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
+                size_bytes: 3_095_000_000,
+            }],
+            // Not published upstream. Made with whisper.cpp's quantize tool from
+            // ggml-large-v3.bin; the URL is where it would be if it were.
+            "whisper-large-q8" => vec![ModelFile {
+                filename: "ggml-large-v3-q8_0.bin",
+                url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q8_0.bin",
+                size_bytes: 1_656_000_000,
+            }],
             "parakeet-v3-int8" => vec![
                 ModelFile {
                     filename: "encoder-model.int8.onnx",
@@ -175,6 +187,26 @@ pub static AVAILABLE_MODELS: &[ModelInfo] = &[
         total_size_bytes: 1_080_000_000,
         is_directory: false,
         accuracy_score: 0.95,
+        speed_score: 0.4,
+    },
+    ModelInfo {
+        id: "whisper-large-full",
+        name: "Whisper Large (full)",
+        description: "Large v3 without quantisation. Best for languages other than English.",
+        engine_type: EngineType::Whisper,
+        total_size_bytes: 3_095_000_000,
+        is_directory: false,
+        accuracy_score: 0.97,
+        speed_score: 0.35,
+    },
+    ModelInfo {
+        id: "whisper-large-q8",
+        name: "Whisper Large (Q8)",
+        description: "Large v3 at 8 bits: nearly the full model's accuracy at half the size. Made locally with whisper-quantize.",
+        engine_type: EngineType::Whisper,
+        total_size_bytes: 1_656_000_000,
+        is_directory: false,
+        accuracy_score: 0.96,
         speed_score: 0.4,
     },
     ModelInfo {

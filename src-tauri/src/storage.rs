@@ -18,48 +18,27 @@ pub(crate) fn get_recordings_dir() -> Result<PathBuf, String> {
     Ok(recordings_dir)
 }
 
-// The data folder was called "hyperwhisper" before the app was renamed to
-// Omegawhisper. Move it to the new name once, so the downloaded models
-// (several GB) and old recordings are kept instead of downloaded again.
-// Must run before anything else touches the data folder.
-pub(crate) fn migrate_legacy_data_dir() {
-    let data_dir = match dirs::data_local_dir() {
-        Some(d) => d,
-        None => return,
-    };
-    let old_dir = data_dir.join("hyperwhisper");
-    let new_dir = data_dir.join("omegawhisper");
-
-    if !old_dir.is_dir() {
-        return;
+// Show a folder in the file manager. The opener plugin's detached launch
+// double-forks and disowns xdg-open, and on KDE that xdg-open opens nothing
+// while reporting success; a plain spawn that is waited on does open Dolphin.
+pub(crate) fn open_folder(dir: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("xdg-open")
+            .arg(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("xdg-open could not start: {}", e))?;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
     }
-
-    if let Ok(mut entries) = fs::read_dir(&new_dir) {
-        if entries.next().is_some() {
-            // Both folders hold data - do not touch either one.
-            eprintln!(
-                "Data folder migration skipped: {} already has files. Old data is still in {}",
-                new_dir.display(),
-                old_dir.display()
-            );
-            return;
-        }
-        // New folder exists but is empty: remove it so the rename can use the name.
-        if let Err(e) = fs::remove_dir(&new_dir) {
-            eprintln!("Could not remove empty {}: {}", new_dir.display(), e);
-            return;
-        }
-    }
-
-    match fs::rename(&old_dir, &new_dir) {
-        Ok(()) => eprintln!("Moved {} to {}", old_dir.display(), new_dir.display()),
-        Err(e) => eprintln!(
-            "Failed to move {} to {}: {}",
-            old_dir.display(),
-            new_dir.display(),
-            e
-        ),
-    }
+    #[cfg(not(target_os = "linux"))]
+    tauri_plugin_opener::open_path(dir, None::<&str>).map_err(|e| e.to_string())
 }
 
 // Deletes every recording in a folder. Only .wav files, so anything else that

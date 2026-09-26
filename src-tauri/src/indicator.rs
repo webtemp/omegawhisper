@@ -21,6 +21,11 @@ pub(crate) const INDICATOR_H: f64 = 200.0;
 // than once at startup, so plugging a monitor in or out, or changing
 // resolution, is picked up without restarting.
 pub(crate) fn position_indicator(app: &AppHandle) {
+    // Under Wayland the layer shell places it; a window cannot move itself.
+    #[cfg(target_os = "linux")]
+    if crate::linux::on_wayland() {
+        return;
+    }
     let Some(win) = app.get_webview_window("indicator") else {
         return;
     };

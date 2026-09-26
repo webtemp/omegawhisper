@@ -3,6 +3,8 @@
 // No microphone, no model, no windows.
 use crate::analysis::*;
 use crate::chime::*;
+use crate::history::*;
+use crate::live::*;
 use crate::managers::transcription::{needs_load, onnx_accelerator, GpuChoice};
 use crate::settings::*;
 use crate::storage::delete_recordings_in;
@@ -224,16 +226,21 @@ fn only_real_speech_is_sent_to_the_model() {
 // ---- raising the level of a quiet recording ---------------------------
 
 #[test]
-fn quiet_recordings_are_raised_but_an_empty_room_is_not() {
+fn quiet_recordings_are_raised_to_normal_however_quiet() {
     // (recording, expected gain, why)
-    // A gain of 1.0 means the recording was left exactly as it was.
+    // A gain of 1.0 means the recording was left exactly as it was. The
+    // speech detector runs before this, so an empty room never gets here.
     let cases: &[(Vec<f32>, f32, &str)] = &[
         (Vec::new(), 1.0, "nothing recorded"),
-        (blocks(&[(10, 0.0)]), 1.0, "digital silence is never raised"),
+        (
+            blocks(&[(10, 0.0)]),
+            1.0,
+            "digital silence cannot be raised",
+        ),
         (
             blocks(&[(10, 0.002)]),
-            1.0,
-            "an empty room stays quiet - raising it is how invented sentences got typed",
+            40.0,
+            "a headset at low gain is brought up to normal",
         ),
         (
             blocks(&[(10, 0.02)]),
@@ -241,9 +248,9 @@ fn quiet_recordings_are_raised_but_an_empty_room_is_not() {
             "quiet speech is brought up to normal",
         ),
         (
-            blocks(&[(10, 0.006)]),
-            10.0,
-            "very quiet speech stops at ten times",
+            blocks(&[(10, 0.0005)]),
+            100.0,
+            "the gain stops at a hundred times",
         ),
         (
             blocks(&[(10, 0.2)]),
@@ -369,7 +376,7 @@ fn biggest_step(samples: &[f32]) -> f32 {
 // Anything shorter than this is left alone whatever else it is.
 const PAST_THE_OPENING: usize = 170;
 
-// What Settings starts out saying: 2.2 s, first 5 s protected.
+// What Settings starts out saying: 2.2 s, first 1.5 s protected.
 fn rules() -> PauseRules {
     PauseRules {
         cutoff_ms: default_pause_cutoff_ms(),
@@ -466,7 +473,7 @@ fn a_pause_in_the_opening_seconds_is_left_alone() {
             "a 3 s pause 0.6 s in: too close to the first words",
         ),
         (
-            blocks(&[(99, 0.1), (100, 0.0), (20, 0.1)]),
+            blocks(&[(49, 0.1), (100, 0.0), (20, 0.1)]),
             "one frame short of the opening being over",
         ),
         (
@@ -481,7 +488,7 @@ fn a_pause_in_the_opening_seconds_is_left_alone() {
     }
 
     // One frame later and it is shortened, so the line is where it says it is.
-    let mut audio = blocks(&[(100, 0.1), (100, 0.0), (20, 0.1)]);
+    let mut audio = blocks(&[(50, 0.1), (100, 0.0), (20, 0.1)]);
     assert!(
         shorten_long_pauses(&mut audio, rules()) > 0.0,
         "a pause starting just after the opening is shortened"
@@ -714,7 +721,7 @@ fn frequency_bands_stay_in_range_and_follow_the_tone() {
     let fft = planner.plan_fft_forward(FFT_SIZE);
 
     // Too short to measure: a full set of empty bars, not a crash.
-    let short = frequency_bands(&[0.1; 100], &fft);
+    let short = frequency_bands(&[0.1; 100], &fft, 16_000);
     assert_eq!(short.len(), BAND_COUNT);
     assert!(
         short.iter().all(|&b| b == 0.0),
@@ -722,12 +729,12 @@ fn frequency_bands_stay_in_range_and_follow_the_tone() {
     );
 
     // Silence: every bar empty.
-    let silent = frequency_bands(&vec![0.0; FFT_SIZE], &fft);
+    let silent = frequency_bands(&vec![0.0; FFT_SIZE], &fft, 16_000);
     assert!(silent.iter().all(|&b| b == 0.0), "silence gives no bars");
 
     // A single tone lights up one region, and no bar leaves the 0-to-1 range.
     let tone = sine(FFT_SIZE, 440.0, 16_000.0, 0.5);
-    let bands = frequency_bands(&tone, &fft);
+    let bands = frequency_bands(&tone, &fft, 16_000);
     assert_eq!(bands.len(), BAND_COUNT);
     assert!(
         bands.iter().all(|&b| (0.0..=1.0).contains(&b)),
@@ -740,12 +747,27 @@ fn frequency_bands_stay_in_range_and_follow_the_tone() {
         .map(|(i, _)| i)
         .unwrap();
     assert!(
-        (28..=42).contains(&loudest),
-        "a 440 Hz tone should light up the middle of the display, not bar {loudest}"
+        (18..=30).contains(&loudest),
+        "a 440 Hz tone sits a third of the way across an 80 Hz to 8 kHz display, not at bar {loudest}"
     );
     assert!(
         bands[0] < bands[loudest] * 0.5,
         "the lowest bar should stay quiet"
+    );
+
+    // The display covers up to 8 kHz whatever the rate, so a high tone lands
+    // on the right at 48 kHz just as at 16 kHz.
+    let high = sine(FFT_SIZE, 6_000.0, 48_000.0, 0.5);
+    let bands = frequency_bands(&high, &fft, 48_000);
+    let loudest = bands
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .unwrap();
+    assert!(
+        loudest >= 54,
+        "a 6 kHz tone should light up the right edge, not bar {loudest}"
     );
 }
 
@@ -960,8 +982,8 @@ fn a_settings_file_from_before_the_move_keeps_its_defaults() {
     assert_eq!(prefs.shortcut, "Alt+Space");
     assert!(prefs.active_local_model_id.is_none());
     assert!(
-        !prefs.pause_shortening,
-        "pause-shortening is off unless it has been switched on"
+        prefs.pause_shortening,
+        "pause-shortening is on unless it has been switched off"
     );
     // A file written before these existed must not read as "cut everything,
     // and cut it at the start too".
@@ -974,8 +996,8 @@ fn a_settings_file_from_before_the_move_keeps_its_defaults() {
         "and the opening is protected until that is switched off"
     );
     assert_eq!(
-        prefs.pause_opening_ms, 3000,
-        "the opening falls back to 3 s"
+        prefs.pause_opening_ms, 1500,
+        "the opening falls back to 1.5 s"
     );
     assert!(
         !prefs.migrated_from_browser,
@@ -990,10 +1012,21 @@ fn every_setting_survives_being_written_and_read_back() {
         shortcut: "CommandOrControl+Shift+D".to_string(),
         active_local_model_id: Some("whisper-small".to_string()),
         selected_microphone: Some("MacBook Pro Microphone".to_string()),
+        mic_boost: 1.8,
+        visualisation: "ring".to_string(),
+        language: "bg".to_string(),
         pause_shortening: true,
         pause_cutoff_ms: 3500,
         pause_protect_opening: false,
         pause_opening_ms: 8000,
+        live_typing: true,
+        live_pause_ms: 700,
+        silence_stop: true,
+        silence_stop_ms: 9000,
+        auto_resume: true,
+        auto_resume_ms: 4000,
+        auto_enter: true,
+        tidy_sentence_ends: false,
         onnx_gpu: true,
         whisper_gpu: false,
         migrated_from_browser: true,
@@ -1009,6 +1042,14 @@ fn every_setting_survives_being_written_and_read_back() {
         loaded.pause_opening_ms, 8000,
         "the length is remembered even with the switch off"
     );
+    assert!(loaded.live_typing);
+    assert_eq!(loaded.live_pause_ms, 700);
+    assert!(loaded.silence_stop);
+    assert_eq!(loaded.silence_stop_ms, 9000);
+    assert!(loaded.auto_resume);
+    assert_eq!(loaded.auto_resume_ms, 4000);
+    assert!(loaded.auto_enter);
+    assert!(!loaded.tidy_sentence_ends);
     assert_eq!(
         loaded.active_local_model_id.as_deref(),
         Some("whisper-small")
@@ -1018,7 +1059,13 @@ fn every_setting_survives_being_written_and_read_back() {
         Some("MacBook Pro Microphone")
     );
     assert!(loaded.migrated_from_browser);
-    assert!(loaded.onnx_gpu, "the ONNX GPU switch is written and read back");
+    assert_eq!(loaded.mic_boost, 1.8);
+    assert_eq!(loaded.visualisation, "ring");
+    assert_eq!(loaded.language, "bg");
+    assert!(
+        loaded.onnx_gpu,
+        "the ONNX GPU switch is written and read back"
+    );
     assert!(
         !loaded.whisper_gpu,
         "and so is the Whisper one, including when it is off"
@@ -1114,11 +1161,7 @@ fn moving_a_gpu_switch_makes_the_next_dictation_build_the_model_again() {
         "same model, ONNX switch moved"
     );
     assert!(
-        needs_load(
-            Some(("whisper-turbo", cpu)),
-            "whisper-turbo",
-            whisper_off
-        ),
+        needs_load(Some(("whisper-turbo", cpu)), "whisper-turbo", whisper_off),
         "same model, Whisper switch moved"
     );
 }
@@ -1786,4 +1829,610 @@ fn deleting_from_a_missing_folder_is_an_error_not_a_panic() {
     let missing = std::env::temp_dir().join("omegawhisper-does-not-exist-at-all");
     let _ = fs::remove_dir_all(&missing);
     assert!(delete_recordings_in(&missing).is_err());
+}
+
+#[cfg(target_os = "linux")]
+mod linux_only {
+    use crate::linux::{desktop_entry, xdg_trigger, APP_ID};
+
+    #[test]
+    fn the_dictation_key_is_spelled_the_way_the_portal_reads_it() {
+        assert_eq!(xdg_trigger("F3"), "F3");
+        assert_eq!(xdg_trigger("CommandOrControl+Shift+D"), "CTRL+SHIFT+d");
+        assert_eq!(xdg_trigger("Control+KeyA"), "CTRL+a");
+        assert_eq!(xdg_trigger("Alt+Space"), "ALT+space");
+        assert_eq!(xdg_trigger("Super+Digit1"), "LOGO+1");
+        assert_eq!(xdg_trigger("Shift+Enter"), "SHIFT+Return");
+    }
+
+    // The portal finds the app through this file, named after the app id.
+    #[test]
+    fn the_desktop_file_points_at_the_binary_it_was_written_by() {
+        let entry = desktop_entry("/opt/omegawhisper/omegawhisper");
+        assert!(entry.starts_with("[Desktop Entry]\n"));
+        assert!(entry.contains("\nExec=/opt/omegawhisper/omegawhisper\n"));
+        assert!(entry.contains("\nName=Omegawhisper\n"));
+        assert_eq!(APP_ID, "dev.omegawhisper");
+    }
+}
+
+#[test]
+fn the_microphone_boost_multiplies_and_clips() {
+    let mut samples = vec![0.1, -0.2, 0.3, -0.5];
+    boost_samples(&mut samples, 2.5);
+    assert_eq!(samples, vec![0.25, -0.5, 0.75, -1.0]);
+
+    let mut untouched = vec![0.1, -0.2];
+    boost_samples(&mut untouched, 1.0);
+    assert_eq!(untouched, vec![0.1, -0.2]);
+}
+
+#[test]
+fn the_microphone_boost_stays_between_half_and_a_hundred() {
+    assert_eq!(clamp_mic_boost(0.0), 0.5);
+    assert_eq!(clamp_mic_boost(1.7), 1.7);
+    assert_eq!(clamp_mic_boost(1.23), 1.2);
+    assert_eq!(clamp_mic_boost(50.0), 50.0);
+    assert_eq!(clamp_mic_boost(500.0), 100.0);
+    assert_eq!(clamp_mic_boost(f32::NAN), 1.0);
+}
+
+#[test]
+fn a_settings_file_from_before_the_boost_has_it_off() {
+    let old = r#"{"debug_stats":true,"shortcut":"F3"}"#;
+    let prefs: Prefs = serde_json::from_str(old).expect("an old file still loads");
+    assert_eq!(prefs.mic_boost, 1.0);
+    assert_eq!(Prefs::default().mic_boost, 1.0);
+}
+
+// A 16 kHz mono WAV as samples, whatever its sample width; 48 kHz files are
+// brought down to 16 kHz the way a recording is.
+fn wav_samples_16k(path: &std::path::Path) -> Vec<f32> {
+    let bytes = fs::read(path).expect("wav readable");
+    let rate = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+    let channels = u16::from_le_bytes([bytes[22], bytes[23]]);
+    let bits = u16::from_le_bytes([bytes[34], bytes[35]]);
+    let format = u16::from_le_bytes([bytes[20], bytes[21]]);
+    let mut pos = 12;
+    let data = loop {
+        let id = &bytes[pos..pos + 4];
+        let len = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        if id == b"data" {
+            break &bytes[pos + 8..(pos + 8 + len).min(bytes.len())];
+        }
+        pos += 8 + len;
+    };
+    let samples: Vec<f32> = match (format, bits) {
+        (3, 32) => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        (1, 16) => data
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+            .collect(),
+        other => panic!("unsupported wav format {:?}", other),
+    };
+    let mono = mix_to_mono(samples, channels);
+    if rate == 16_000 {
+        return mono;
+    }
+    let mut resampler = crate::resampler::AudioResampler::new(rate).expect("resampler");
+    let mut out = resampler.process(&mono).expect("resample");
+    out.extend(resampler.flush().unwrap_or_default());
+    out
+}
+
+#[test]
+fn the_speech_detector_hears_speech_in_a_recording_however_quiet() {
+    let jfk = wav_samples_16k(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests-data/jfk.wav"
+    )));
+    let loud = crate::vad::speech_seconds(&jfk).expect("detector runs");
+    assert!(
+        loud > 5.0,
+        "11 s of a speech should be mostly speech, got {loud}"
+    );
+
+    // The same words at a fortieth of the level, which is what a headset at
+    // low gain delivered and the old gate threw away.
+    let quiet: Vec<f32> = jfk.iter().map(|s| s * 0.01).collect();
+    assert!(
+        speech_level(&quiet) < MIN_SPEECH_LEVEL,
+        "quiet enough to fail the old gate"
+    );
+    let heard = crate::vad::speech_seconds(&quiet).expect("detector runs");
+    assert!(
+        (heard - loud).abs() < 1.0,
+        "quiet {heard} against loud {loud}"
+    );
+    assert!(crate::vad::holds_speech(heard));
+}
+
+#[test]
+fn the_speech_detector_hears_nothing_in_noise_or_a_tone() {
+    let hiss = noise(16_000 * 4, 0.3);
+    let heard = crate::vad::speech_seconds(&hiss).expect("detector runs");
+    assert!(
+        !crate::vad::holds_speech(heard),
+        "noise counted as {heard}s of speech"
+    );
+
+    let tone = sine(16_000 * 4, 440.0, 16_000.0, 0.5);
+    let heard = crate::vad::speech_seconds(&tone).expect("detector runs");
+    assert!(
+        !crate::vad::holds_speech(heard),
+        "a tone counted as {heard}s of speech"
+    );
+
+    let nothing = vec![0.0f32; 16_000 * 3];
+    assert_eq!(crate::vad::speech_seconds(&nothing).unwrap(), 0.0);
+}
+
+// Every saved recording on this machine, judged by the detector. Run with
+// --ignored --nocapture to see what it makes of real takes.
+#[test]
+#[ignore]
+fn what_the_speech_detector_makes_of_the_saved_recordings() {
+    let dir = crate::storage::get_recordings_dir().expect("recordings folder");
+    let mut paths: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "wav"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let samples = wav_samples_16k(&path);
+        let (peak, _, _) = audio_stats(&samples);
+        let level = speech_level(&samples);
+        let heard = crate::vad::speech_seconds(&samples).expect("detector runs");
+        println!(
+            "{:<45} {:5.1}s  peak {:.3}  level {:.4}  old gate {:<5}  speech {:4.1}s  new gate {}",
+            path.file_name().unwrap().to_string_lossy(),
+            samples.len() as f32 / 16_000.0,
+            peak,
+            level,
+            holds_speech(level, peak),
+            heard,
+            crate::vad::holds_speech(heard)
+        );
+    }
+}
+
+#[test]
+fn a_settings_file_from_before_the_visualisations_draws_the_waterfall() {
+    let old = r#"{"debug_stats":true,"shortcut":"F3"}"#;
+    let prefs: Prefs = serde_json::from_str(old).expect("an old file still loads");
+    assert_eq!(prefs.visualisation, "waterfall");
+    assert!(VISUALISATIONS.contains(&prefs.visualisation.as_str()));
+}
+
+#[test]
+fn the_detector_sees_every_recording_at_the_same_level() {
+    let quiet = vec![0.0, 0.01, -0.02, 0.005];
+    let scaled = crate::vad::normalized(&quiet);
+    let peak = scaled.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    near(peak, 0.9, 1e-6, "peak after scaling");
+    assert_eq!(crate::vad::normalized(&[0.0, 0.0]), vec![0.0, 0.0]);
+}
+
+#[test]
+fn a_dead_microphone_and_a_silent_room_are_told_apart() {
+    use crate::vad::{judge, Heard};
+    let nothing = vec![0.0f32; 16_000 * 2];
+    assert_eq!(judge(&nothing, 0.0, 0.0), Heard::Dead);
+
+    let hiss = noise(16_000 * 3, 0.2);
+    let (peak, _, _) = audio_stats(&hiss);
+    assert_eq!(judge(&hiss, peak, speech_level(&hiss)), Heard::Silent);
+
+    let jfk = wav_samples_16k(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests-data/jfk.wav"
+    )));
+    let (peak, _, _) = audio_stats(&jfk);
+    match judge(&jfk, peak, speech_level(&jfk)) {
+        Heard::Speech(Some(seconds)) => assert!(seconds > 5.0),
+        other => panic!("a speech should be heard as speech, not {other:?}"),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod typing_tools {
+    use crate::typing::{needs_paste, tool_order};
+
+    #[test]
+    fn the_tool_for_the_session_comes_first() {
+        assert_eq!(tool_order(true), ["wtype", "ydotool", "xdotool"]);
+        assert_eq!(tool_order(false), ["xdotool", "ydotool", "wtype"]);
+    }
+
+    #[test]
+    fn the_paste_chord_is_one_argument_per_key_and_releases_what_it_pressed() {
+        use crate::typing::PASTE_CHORD;
+        assert_eq!(PASTE_CHORD.len(), 4);
+        for key in PASTE_CHORD {
+            let (code, state) = key.split_once(':').expect("code:state");
+            assert!(
+                code.parse::<u16>().is_ok() && matches!(state, "0" | "1"),
+                "{key}"
+            );
+        }
+        assert_eq!(PASTE_CHORD[0], "29:1", "Ctrl goes down first");
+        assert_eq!(PASTE_CHORD[3], "29:0", "and comes up last");
+    }
+
+    #[test]
+    fn everything_ydotool_is_given_is_pasted() {
+        assert!(needs_paste("ydotool", "plain ascii, any length"));
+        assert!(needs_paste("ydotool", "Здравей"));
+        assert!(needs_paste("ydotool", "wörld"));
+        assert!(!needs_paste("wtype", "Здравей"));
+        assert!(!needs_paste("xdotool", "Здравей"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod microphone_list {
+    use crate::microphone::parse_sources;
+
+    const PACTL: &str = r#"[
+        {"index": 70, "name": "alsa_output.usb-Speaker.monitor", "description": "Monitor of Speakers"},
+        {"index": 74, "name": "alsa_input.usb-Generic.Mic", "description": "USB Audio Microphone"},
+        {"index": 76, "name": "alsa_input.usb-HyperX.mono", "description": "HyperX Cloud Alpha S Mono"},
+        {"index": 77, "name": "alsa_input.unnamed", "description": ""}
+    ]"#;
+
+    #[test]
+    fn monitors_are_left_out_and_the_default_is_marked() {
+        let list = parse_sources(PACTL.as_bytes(), "alsa_input.usb-HyperX.mono").unwrap();
+        let names: Vec<&str> = list.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "alsa_input.usb-Generic.Mic",
+                "alsa_input.usb-HyperX.mono",
+                "alsa_input.unnamed"
+            ]
+        );
+        assert_eq!(list[1].label, "HyperX Cloud Alpha S Mono");
+        assert!(list[1].is_default);
+        assert!(!list[0].is_default);
+    }
+
+    #[test]
+    fn a_source_without_a_description_is_shown_by_name() {
+        let list = parse_sources(PACTL.as_bytes(), "").unwrap();
+        assert_eq!(list[2].label, "alsa_input.unnamed");
+    }
+
+    #[test]
+    fn a_broken_answer_is_an_error_not_an_empty_menu() {
+        assert!(parse_sources(b"not json", "").is_err());
+    }
+}
+
+#[test]
+fn the_style_prompt_follows_the_chosen_language_and_stays_out_of_detection() {
+    use crate::managers::transcription::style_prompt;
+    assert!(style_prompt(Some("en")).unwrap().starts_with("Hello."));
+    assert!(style_prompt(Some("bg")).unwrap().starts_with("Здравей."));
+    assert_eq!(style_prompt(Some("de")), None, "no prompt written for it");
+    assert_eq!(
+        style_prompt(None),
+        None,
+        "a prompt would pull detection into its language"
+    );
+}
+
+#[test]
+fn the_language_setting_becomes_what_whisper_is_told() {
+    assert_eq!(whisper_language("auto"), None);
+    assert_eq!(whisper_language("bg"), Some("bg".to_string()));
+    assert_eq!(
+        whisper_language("xx"),
+        None,
+        "an unknown code is left to detection"
+    );
+    let old = r#"{"debug_stats":true,"shortcut":"F3"}"#;
+    let prefs: Prefs = serde_json::from_str(old).expect("an old file still loads");
+    assert_eq!(prefs.language, "auto");
+}
+
+// ---- the last transcripts in the tray -----------------------------------
+
+fn transcript(text: &str) -> Transcript {
+    Transcript {
+        when: "2026-09-26 14:32".to_string(),
+        text: text.to_string(),
+    }
+}
+
+#[test]
+fn the_newest_transcript_is_first_and_the_list_stays_at_twenty() {
+    let mut list = Vec::new();
+    for i in 0..25 {
+        remember(&mut list, transcript(&format!("dictation {i}")), false, HISTORY_LIMIT);
+    }
+    assert_eq!(list.len(), HISTORY_LIMIT);
+    assert_eq!(list[0].text, "dictation 24", "newest first");
+    assert_eq!(list[19].text, "dictation 5", "the oldest five are gone");
+}
+
+#[test]
+fn the_same_text_twice_in_a_row_is_one_entry() {
+    let mut list = Vec::new();
+    remember(&mut list, transcript("hello"), false, HISTORY_LIMIT);
+    remember(&mut list, transcript("hello"), false, HISTORY_LIMIT);
+    assert_eq!(list.len(), 1);
+    remember(&mut list, transcript("again"), false, HISTORY_LIMIT);
+    remember(&mut list, transcript("hello"), false, HISTORY_LIMIT);
+    assert_eq!(list.len(), 3, "the same text later on is a new entry");
+}
+
+#[test]
+fn a_dictation_picked_up_after_a_silence_stop_joins_the_previous_entry() {
+    let mut list = Vec::new();
+    remember(&mut list, transcript("First part."), false, HISTORY_LIMIT);
+    remember(&mut list, transcript("Second part."), true, HISTORY_LIMIT);
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].text, "First part. Second part.");
+    remember(&mut list, transcript("Second part."), true, HISTORY_LIMIT);
+    assert_eq!(list[0].text, "First part. Second part. Second part.", "a continuation is never folded as a repeat");
+    remember(&mut list, transcript("Only part."), true, HISTORY_LIMIT);
+    assert_eq!(list.len(), 1, "with nothing before it, continuing is just adding");
+    let mut empty = Vec::new();
+    remember(&mut empty, transcript("Only part."), true, HISTORY_LIMIT);
+    assert_eq!(empty.len(), 1);
+}
+
+#[test]
+fn a_menu_label_is_one_short_line_with_the_time() {
+    let long = "word ".repeat(40);
+    let label = menu_label(&transcript(&long));
+    assert!(label.starts_with("26 Sep 14:32  word word"), "{label}");
+    assert!(label.ends_with('…'), "{label}");
+    assert!(label.chars().count() <= 14 + 48, "{label}");
+
+    let label = menu_label(&transcript("line one\nline two\ttabbed"));
+    assert_eq!(label, "26 Sep 14:32  line one line two tabbed");
+
+    let label = menu_label(&transcript("this & that"));
+    assert_eq!(label, "26 Sep 14:32  this && that", "& is a mnemonic in a menu label");
+
+    let label = menu_label(&transcript("Здравей, свят"));
+    assert_eq!(label, "26 Sep 14:32  Здравей, свят");
+}
+
+#[test]
+fn the_transcript_history_survives_being_written_and_read_back() {
+    let list = vec![transcript("first"), transcript("second & third")];
+    let text = serde_json::to_string(&list).unwrap();
+    let loaded: Vec<Transcript> = serde_json::from_str(&text).unwrap();
+    assert_eq!(loaded, list);
+    assert!(serde_json::from_str::<Vec<Transcript>>("not json").is_err());
+}
+
+
+// ---- typing while you talk ----------------------------------------------
+
+// Stands in for Silero: a frame is speech when it is loud enough. The
+// splitter scales every frame to a fixed peak first, so the threshold is on
+// the scaled copy.
+struct Loud;
+
+impl SpeechDetector for Loud {
+    fn is_speech(&mut self, frame: &[f32]) -> bool {
+        frame.iter().any(|s| s.abs() > 0.3)
+    }
+}
+
+fn splitter(pause_ms: u32) -> Segmenter<Loud> {
+    Segmenter::new(Loud, pause_ms)
+}
+
+#[test]
+fn live_settings_start_switched_on() {
+    let prefs = Prefs::default();
+    assert!(prefs.live_typing);
+    assert_eq!(prefs.live_pause_ms, 700);
+    assert!(prefs.silence_stop);
+    assert_eq!(prefs.silence_stop_ms, 3500);
+    assert!(!prefs.auto_resume, "listening on after a stop is opt-in");
+    assert_eq!(prefs.auto_resume_ms, 6000);
+    assert!(!prefs.auto_enter);
+    assert!(prefs.tidy_sentence_ends);
+    let old: Prefs = serde_json::from_str(r#"{"pause_shortening":true}"#).unwrap();
+    assert!(old.live_typing, "a file from before live typing gets it too");
+    assert!(old.silence_stop);
+    assert_eq!(old.silence_stop_ms, 3500);
+}
+
+#[test]
+fn a_soft_syllable_does_not_end_speech_but_a_soft_noise_does_not_start_it() {
+    assert!(!still_speech(false, 0.4), "below the start line: not speech");
+    assert!(still_speech(false, 0.5), "on it: speech starts");
+    assert!(still_speech(true, 0.35), "once started, a softer frame keeps it");
+    assert!(!still_speech(true, 0.25), "until it drops under the hold line");
+}
+
+#[test]
+fn the_pause_bar_fills_from_the_last_word_to_the_cut() {
+    let mut splitter = splitter(1000);
+    splitter.feed(&blocks(&[(40, 0.0)]));
+    near(splitter.pause_progress(), 0.0, 1e-6, "nothing said yet");
+    splitter.feed(&blocks(&[(33, 0.1)]));
+    near(splitter.pause_progress(), 0.0, 1e-6, "still talking");
+    splitter.feed(&blocks(&[(17, 0.0)]));
+    near(splitter.pause_progress(), 0.5, 0.02, "half way");
+    splitter.feed(&blocks(&[(17, 0.0)]));
+    near(splitter.pause_progress(), 0.0, 1e-6, "cut, and the bar starts over");
+}
+
+#[test]
+fn the_silence_stop_follows_the_speakers_longest_pause() {
+    let mut splitter = splitter(700);
+    splitter.feed(&blocks(&[(40, 0.0), (33, 0.1)]));
+    near(splitter.stop_after_seconds(3.5), 2.0, 1e-6, "no pause yet: the floor");
+    // A 0.6 s pause, then more words.
+    splitter.feed(&blocks(&[(20, 0.0), (33, 0.1)]));
+    near(splitter.stop_after_seconds(3.5), 2.0, 1e-6, "twice 0.6 s is under the floor");
+    // A 1.5 s pause, then more words.
+    splitter.feed(&blocks(&[(50, 0.0), (33, 0.1)]));
+    near(splitter.stop_after_seconds(3.5), 3.0, 0.05, "twice the longest pause");
+    // A 4 s pause: the setting caps it.
+    splitter.feed(&blocks(&[(134, 0.0), (33, 0.1)]));
+    near(splitter.stop_after_seconds(3.5), 3.5, 1e-6, "never over the setting");
+    near(splitter.stop_after_seconds(1.5), 1.5, 1e-6, "a setting under the floor wins");
+
+    let mut fresh = self::splitter(700);
+    fresh.feed(&blocks(&[(200, 0.0), (33, 0.1)]));
+    near(fresh.stop_after_seconds(3.5), 2.0, 1e-6, "the run-up before the first word is not a pause");
+}
+
+#[test]
+fn a_piece_cut_at_a_hesitation_loses_its_dots_and_fillers() {
+    let cases: &[(&str, &str)] = &[
+        ("and then, uh, uh...", "and then"),
+        ("and then...", "and then"),
+        ("and then…", "and then"),
+        ("So I went there, um", "So I went there"),
+        ("It works. Uh...", "It works."),
+        ("What is happening here now is that", "What is happening here now is that"),
+        ("Done.", "Done."),
+        ("Really?", "Really?"),
+        ("uh...", ""),
+        ("Здравей, ъъъ...", "Здравей, ъъъ"),
+    ];
+    for &(given, want) in cases {
+        assert_eq!(tidy_end(given), want, "{given:?}");
+    }
+}
+
+#[test]
+fn a_sentence_goes_out_once_the_pause_after_it_is_long_enough() {
+    let mut splitter = splitter(1000);
+    // 1 s of speech, then silence one frame short of a second.
+    let speech = blocks(&[(33, 0.1)]);
+    assert!(splitter.feed(&speech).is_empty(), "still talking");
+    let short = blocks(&[(33, 0.0)]);
+    assert!(splitter.feed(&short).is_empty(), "the pause is not over yet");
+    let out = splitter.feed(&blocks(&[(1, 0.0)]));
+    assert_eq!(out.len(), 1, "one more frame and the sentence is out");
+    // The speech and a 0.3 s tail, not the whole second of silence.
+    let frames = out[0].len() / 480;
+    assert_eq!(frames, 33 + 10, "speech plus the kept tail");
+}
+
+#[test]
+fn audio_arriving_in_odd_sized_chunks_is_split_the_same() {
+    let audio = blocks(&[(33, 0.1), (40, 0.0), (33, 0.1), (40, 0.0)]);
+    let mut whole = splitter(1000);
+    let mut out_whole = whole.feed(&audio);
+    let mut pieces = splitter(1000);
+    let mut out_pieces = Vec::new();
+    for chunk in audio.chunks(1000) {
+        out_pieces.extend(pieces.feed(chunk));
+    }
+    assert_eq!(out_whole.len(), 2);
+    assert_eq!(out_pieces.len(), 2, "two sentences either way");
+    assert_eq!(out_whole.pop().unwrap().len(), out_pieces.pop().unwrap().len());
+}
+
+#[test]
+fn the_run_up_before_a_sentence_is_short_and_a_lone_click_is_not_a_sentence() {
+    let mut splitter = splitter(1000);
+    // Five seconds of nothing, then a word.
+    assert!(splitter.feed(&blocks(&[(170, 0.0)])).is_empty());
+    let out = splitter.feed(&blocks(&[(33, 0.1), (40, 0.0)]));
+    assert_eq!(out.len(), 1);
+    let frames = out[0].len() / 480;
+    assert!(
+        frames <= 16 + 33 + 10,
+        "at most half a second of run-up is kept, got {frames} frames"
+    );
+
+    // One 30 ms blip and a long pause: under 0.3 s of speech, so nothing.
+    let mut splitter = self::splitter(1000);
+    assert!(splitter.feed(&blocks(&[(1, 0.1), (60, 0.0)])).is_empty());
+}
+
+#[test]
+fn what_is_left_at_the_end_is_the_last_sentence() {
+    let mut splitter = splitter(1000);
+    assert!(splitter.feed(&blocks(&[(33, 0.1), (40, 0.0)])).len() == 1);
+    assert!(splitter.feed(&blocks(&[(20, 0.1), (5, 0.0)])).is_empty());
+    let last = splitter.finish().expect("the unfinished sentence comes out");
+    assert!(last.len() / 480 >= 20, "with all of its speech");
+
+    let mut splitter = self::splitter(1000);
+    assert!(splitter.feed(&blocks(&[(33, 0.1), (40, 0.0)])).len() == 1);
+    assert!(splitter.finish().is_none(), "nothing was said after the last cut");
+}
+
+#[test]
+fn silence_is_counted_from_the_last_word_and_from_the_start() {
+    let mut splitter = splitter(1000);
+    splitter.feed(&blocks(&[(100, 0.0)]));
+    near(splitter.silence_seconds(), 3.0, 0.05, "quiet from the start");
+    splitter.feed(&blocks(&[(10, 0.1)]));
+    near(splitter.silence_seconds(), 0.0, 0.001, "a word resets it");
+    splitter.feed(&blocks(&[(200, 0.0)]));
+    near(splitter.silence_seconds(), 6.0, 0.05, "and it grows again after");
+}
+
+#[test]
+fn a_quiet_microphone_is_split_like_a_loud_one() {
+    // The same sentence at a fifth of the level, a headset at low gain. The
+    // detector sees a scaled copy, so the cut lands in the same place.
+    let loud = blocks(&[(33, 0.1), (40, 0.0)]);
+    let quiet: Vec<f32> = loud.iter().map(|s| s * 0.2).collect();
+    let mut a = splitter(1000);
+    let mut b = splitter(1000);
+    let out_loud = a.feed(&loud);
+    let out_quiet = b.feed(&quiet);
+    assert_eq!(out_loud.len(), 1);
+    assert_eq!(out_quiet.len(), 1);
+    assert_eq!(out_loud[0].len(), out_quiet[0].len());
+}
+
+// Run with --ignored --nocapture: where the live splitter would cut each of
+// the saved recordings, fed in 20 ms chunks as the microphone delivers them.
+#[test]
+#[ignore]
+fn where_the_sentence_splitter_cuts_the_saved_recordings() {
+    let dir = crate::storage::get_recordings_dir().expect("recordings folder");
+    let mut paths: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "wav"))
+        .filter(|p| !p.to_string_lossy().contains("model-input"))
+        .collect();
+    paths.sort();
+    for path in paths.iter().rev().take(6) {
+        let samples = wav_samples_16k(path);
+        let mut splitter = Segmenter::new(crate::vad::Silero::new().unwrap(), 1000);
+        let mut cuts = Vec::new();
+        for chunk in samples.chunks(320) {
+            for sentence in splitter.feed(chunk) {
+                cuts.push(sentence.len() as f32 / 16_000.0);
+            }
+        }
+        let last = splitter.finish().map(|s| s.len() as f32 / 16_000.0);
+        println!(
+            "{:<32} {:5.1}s  sentences {:?}  last {:?}",
+            path.file_name().unwrap().to_string_lossy(),
+            samples.len() as f32 / 16_000.0,
+            cuts.iter().map(|s| format!("{s:.1}")).collect::<Vec<_>>(),
+            last.map(|s| format!("{s:.1}"))
+        );
+    }
 }

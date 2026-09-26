@@ -15,9 +15,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { handOverBrowserSettings } from "@/lib/browser-settings";
+import { DEFAULT_VISUALISATION, VISUALISATIONS } from "@/components/visualisations";
+import { boostToSlider, sliderToBoost, SLIDER_STEPS } from "@/lib/boost-slider";
+import { LANGUAGES } from "@/lib/languages";
 
 interface AudioDevice {
   name: string;
+  label: string;
   is_default: boolean;
 }
 
@@ -30,6 +34,14 @@ interface ModelInfo {
   accuracy_score: number;
   speed_score: number;
   status: string;
+}
+
+// What differs between the systems. Rust answers once; the wording follows.
+interface PlatformInfo {
+  os: string;
+  shortcut_set_by_system: boolean;
+  whisper_gpu: string;
+  onnx_gpu: string;
 }
 
 interface ModelDownloadProgress {
@@ -47,16 +59,27 @@ interface ModelDownloadProgress {
 interface Settings {
   active_local_model_id: string | null;
   selected_microphone: string | null;
+  mic_boost: number;
+  visualisation: string;
+  language: string;
   pause_shortening: boolean;
   pause_cutoff_ms: number;
   pause_protect_opening: boolean;
   pause_opening_ms: number;
+  live_typing: boolean;
+  live_pause_ms: number;
+  silence_stop: boolean;
+  silence_stop_ms: number;
+  auto_resume: boolean;
+  auto_resume_ms: number;
+  auto_enter: boolean;
+  tidy_sentence_ends: boolean;
   onnx_gpu: boolean;
   whisper_gpu: boolean;
 }
 
 // The models one graphics-card switch decides for. The ones already on this
-// Mac are brighter: those are the ones the switch changes anything for today.
+// machine are brighter: those are the ones the switch changes anything for today.
 function ModelsAffected({ models }: { models: ModelInfo[] }) {
   if (models.length === 0) return null;
   return (
@@ -86,6 +109,12 @@ export function SettingsPage() {
   // The microphone by name. null means whichever one the system has set.
   const [microphone, setMicrophone] = useState<string | null>(null);
   const [deviceError, setDeviceError] = useState<string | null>(null);
+  // Multiplies the microphone before the speech check. 1 is off.
+  const [micBoost, setMicBoost] = useState(1);
+  // How the indicator draws the sound while you speak.
+  const [viz, setViz] = useState(DEFAULT_VISUALISATION);
+  // The language spoken. "auto" lets the model decide from the first words.
+  const [language, setLanguage] = useState("auto");
 
   // Nothing is saved until the saved settings are on screen. Without this the
   // empty starting values below would be written over the real ones.
@@ -118,16 +147,35 @@ export function SettingsPage() {
 
   // Shorten long pauses before the model reads the recording. The two lengths
   // are kept as text while being typed, so a half-typed number is not saved.
-  const [pauseShortening, setPauseShortening] = useState(false);
+  const [pauseShortening, setPauseShortening] = useState(true);
   const [pauseCutoffMs, setPauseCutoffMs] = useState("2200");
   const [pauseProtectOpening, setPauseProtectOpening] = useState(true);
-  const [pauseOpeningMs, setPauseOpeningMs] = useState("3000");
+  const [pauseOpeningMs, setPauseOpeningMs] = useState("1500");
+  // Type each sentence as it ends, and end the recording on silence.
+  const [liveTyping, setLiveTyping] = useState(true);
+  const [livePauseMs, setLivePauseMs] = useState("700");
+  const [silenceStop, setSilenceStop] = useState(true);
+  const [silenceStopMs, setSilenceStopMs] = useState("3500");
+  const [autoResume, setAutoResume] = useState(false);
+  const [autoResumeMs, setAutoResumeMs] = useState("6000");
+  const [autoEnter, setAutoEnter] = useState(false);
+  const [tidyEnds, setTidyEnds] = useState(true);
 
   // The dictation key. Rust owns it: it has to be registered at startup, long
   // before this window exists.
   const [shortcut, setShortcut] = useState("F3");
   const [capturing, setCapturing] = useState(false);
   const [shortcutError, setShortcutError] = useState<string | null>(null);
+
+  // On Wayland the desktop holds the key and its own settings change it, so
+  // this window shows the key and opens that page instead of capturing one.
+  const [platform, setPlatform] = useState<PlatformInfo>({
+    os: "macos",
+    shortcut_set_by_system: false,
+    whisper_gpu: "Metal",
+    onnx_gpu: "CoreML",
+  });
+  const where = platform.os === "linux" ? "system tray" : "menu bar";
   const [showAllModels, setShowAllModels] = useState(false);
 
   // Disable right-click context menu
@@ -150,12 +198,23 @@ export function SettingsPage() {
         const saved = await invoke<Settings>("get_settings");
         setActiveModelId(saved.active_local_model_id);
         setMicrophone(saved.selected_microphone);
+        setMicBoost(saved.mic_boost);
+        setViz(saved.visualisation);
+        setLanguage(saved.language);
         setOnnxGpu(saved.onnx_gpu);
         setWhisperGpu(saved.whisper_gpu);
         setPauseShortening(saved.pause_shortening);
         setPauseCutoffMs(String(saved.pause_cutoff_ms));
         setPauseProtectOpening(saved.pause_protect_opening);
         setPauseOpeningMs(String(saved.pause_opening_ms));
+        setLiveTyping(saved.live_typing);
+        setLivePauseMs(String(saved.live_pause_ms));
+        setSilenceStop(saved.silence_stop);
+        setSilenceStopMs(String(saved.silence_stop_ms));
+        setAutoResume(saved.auto_resume);
+        setAutoResumeMs(String(saved.auto_resume_ms));
+        setAutoEnter(saved.auto_enter);
+        setTidyEnds(saved.tidy_sentence_ends);
       } catch (err) {
         console.error("Could not read the saved settings:", err);
       }
@@ -224,9 +283,23 @@ export function SettingsPage() {
     };
   }, []);
 
+  // Read the key, then follow it: on Wayland the desktop answers a moment
+  // after this window opens, and can change it at any time.
   useEffect(() => {
-    invoke<string>("get_shortcut").then(setShortcut).catch(() => {});
+    invoke<PlatformInfo>("get_platform").then(setPlatform).catch(() => {});
+    const load = () =>
+      invoke<string>("get_shortcut").then(setShortcut).catch(() => {});
+    load();
+    const unlisten = listen("shortcut-changed", load);
+    return () => {
+      unlisten.then((fn) => fn()).catch(() => {});
+    };
   }, []);
+
+  const openShortcutSettings = () => {
+    setShortcutError(null);
+    invoke("open_shortcut_settings").catch((err) => setShortcutError(String(err)));
+  };
 
   // While capturing, the next key combination becomes the new shortcut. Written
   // the way Tauri parses it: "CommandOrControl+Shift+D".
@@ -461,22 +534,33 @@ export function SettingsPage() {
                 <p className="text-xs text-white/40">
                   {capturing
                     ? "Escape to keep the current one"
-                    : "Starts and stops dictation from any app"}
+                    : platform.shortcut_set_by_system
+                      ? "Held by the desktop. Change it in its shortcut settings."
+                      : "Starts and stops dictation from any app"}
                 </p>
               </div>
-              <button
-                onClick={() => {
-                  setShortcutError(null);
-                  setCapturing((on) => !on);
-                }}
-                className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
-                  capturing
-                    ? "bg-white/20 text-white"
-                    : "bg-white/10 text-white/80 hover:bg-white/20 hover:text-white"
-                }`}
-              >
-                {capturing ? "Cancel" : "Change"}
-              </button>
+              {platform.shortcut_set_by_system ? (
+                <button
+                  onClick={openShortcutSettings}
+                  className="px-3 py-1.5 text-xs rounded-md transition-colors bg-white/10 text-white/80 hover:bg-white/20 hover:text-white"
+                >
+                  Change...
+                </button>
+              ) : (
+                <button
+                  onClick={() => {
+                    setShortcutError(null);
+                    setCapturing((on) => !on);
+                  }}
+                  className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                    capturing
+                      ? "bg-white/20 text-white"
+                      : "bg-white/10 text-white/80 hover:bg-white/20 hover:text-white"
+                  }`}
+                >
+                  {capturing ? "Cancel" : "Change"}
+                </button>
+              )}
             </div>
             {shortcutError && (
               <p className="text-xs text-red-400">{shortcutError}</p>
@@ -493,7 +577,7 @@ export function SettingsPage() {
               <div className="pr-3">
                 <span className="text-sm text-white">Start when the computer starts</span>
                 <p className="text-xs text-white/40">
-                  Omegawhisper appears in the menu bar after logging in, ready
+                  Omegawhisper appears in the {where} after logging in, ready
                   for the dictation key. No window opens.
                 </p>
               </div>
@@ -515,6 +599,75 @@ export function SettingsPage() {
             )}
           </div>
 
+          {/* Language. Chosen, Whisper is told and gets a style prompt in
+              that language; left to detection, it gets no prompt at all,
+              since a prompt in one language pulls the text into it. */}
+          <div className="space-y-2">
+            <Label className="text-xs uppercase tracking-wide text-white/50">
+              Language
+            </Label>
+            <Select
+              value={language}
+              onValueChange={(v) => {
+                setLanguage(v);
+                invoke("set_language", { code: v }).catch(() => {});
+              }}
+            >
+              <SelectTrigger className="bg-white/5 border-0 text-white">
+                <SelectValue>
+                  {LANGUAGES.find(([code]) => code === language)?.[1] ?? language}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent className="bg-neutral-800/95 backdrop-blur-xl border-0">
+                {LANGUAGES.map(([code, name]) => (
+                  <SelectItem
+                    key={code}
+                    value={code}
+                    className="text-white/80 focus:bg-white/10 focus:text-white"
+                  >
+                    {name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-white/30">
+              "As spoken" lets the model decide from the first words. Choosing a
+              language also gets you better punctuation in it.
+            </p>
+          </div>
+
+          {/* Indicator. What the little window draws while you speak. */}
+          <div className="space-y-2">
+            <Label className="text-xs uppercase tracking-wide text-white/50">
+              Indicator
+            </Label>
+            <Select
+              value={viz}
+              onValueChange={(v) => {
+                setViz(v);
+                invoke("set_visualisation", { name: v }).catch(() => {});
+              }}
+            >
+              <SelectTrigger className="bg-white/5 border-0 text-white">
+                <SelectValue>
+                  {VISUALISATIONS.find((v) => v.id === viz)?.name ?? viz}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent className="bg-neutral-800/95 backdrop-blur-xl border-0">
+                {VISUALISATIONS.map((v) => (
+                  <SelectItem
+                    key={v.id}
+                    value={v.id}
+                    className="text-white/80 focus:bg-white/10 focus:text-white"
+                  >
+                    <span>{v.name}</span>
+                    <span className="ml-2 text-xs text-white/40">{v.description}</span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
           {/* Microphone */}
           <div className="space-y-2">
             <Label className="text-xs uppercase tracking-wide text-white/50">
@@ -526,7 +679,9 @@ export function SettingsPage() {
             >
               <SelectTrigger className="bg-white/5 border-0 text-white">
                 <SelectValue>
-                  {microphone ?? "Whatever the system is using"}
+                  {microphone
+                    ? audioDevices.find((d) => d.name === microphone)?.label ?? microphone
+                    : "Whatever the system is using"}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent className="bg-neutral-800/95 backdrop-blur-xl border-0">
@@ -539,7 +694,7 @@ export function SettingsPage() {
                     value={device.name}
                     className="text-white/80 focus:bg-white/10 focus:text-white"
                   >
-                    {device.name}
+                    {device.label}
                     {device.is_default && " (system default)"}
                   </SelectItem>
                 ))}
@@ -554,6 +709,43 @@ export function SettingsPage() {
               </p>
             )}
             {deviceError && <p className="text-xs text-red-400">{deviceError}</p>}
+
+            {/* Boost. A multiplier on the microphone before the speech
+                check, for one too quiet to pass it or too hot not to clip. */}
+            <div className="p-3 bg-white/5 rounded-lg space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="pr-3">
+                  <span className="text-sm text-white">Boost</span>
+                  <p className="text-xs text-white/40">
+                    Makes the microphone louder or quieter before the app listens
+                    for speech. Turn it up if it says it heard no speech while you
+                    were talking.
+                  </p>
+                </div>
+                <span className="text-sm text-white font-mono shrink-0">
+                  {micBoost >= 10 ? micBoost.toFixed(0) : micBoost.toFixed(1)}x
+                </span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={SLIDER_STEPS}
+                step={1}
+                value={boostToSlider(micBoost)}
+                onChange={(e) => setMicBoost(sliderToBoost(Number(e.target.value)))}
+                onPointerUp={() => {
+                  invoke<number>("set_mic_boost", { boost: micBoost })
+                    .then(setMicBoost)
+                    .catch(() => {});
+                }}
+                onKeyUp={() => {
+                  invoke<number>("set_mic_boost", { boost: micBoost })
+                    .then(setMicBoost)
+                    .catch(() => {});
+                }}
+                className="w-full accent-green-500"
+              />
+            </div>
           </div>
 
           <div className="space-y-3">
@@ -723,6 +915,7 @@ export function SettingsPage() {
             <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
               <div className="pr-3">
                 <span className="text-sm text-white">Run Whisper on the graphics card</span>
+                <p className="text-xs text-white/40">Through {platform.whisper_gpu}.</p>
                 <ModelsAffected models={whisperModels} />
               </div>
               <button
@@ -746,6 +939,11 @@ export function SettingsPage() {
             <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
               <div className="pr-3">
                 <span className="text-sm text-white">Run Parakeet and Moonshine on the graphics card</span>
+                <p className="text-xs text-white/40">
+                  {platform.onnx_gpu
+                    ? `Through ${platform.onnx_gpu}.`
+                    : "This build has no GPU runtime for these models, so they run on the processor either way."}
+                </p>
                 <ModelsAffected models={onnxModels} />
               </div>
               <button
@@ -878,13 +1076,236 @@ export function SettingsPage() {
                     value={pauseOpeningMs}
                     onChange={(e) => setPauseOpeningMs(e.target.value)}
                     onBlur={() => saveMilliseconds(
-                      "set_pause_opening_ms", pauseOpeningMs, 3000, setPauseOpeningMs
+                      "set_pause_opening_ms", pauseOpeningMs, 1500, setPauseOpeningMs
                     )}
                     className="w-20 h-8 bg-white/10 border-0 text-white text-sm text-right"
                   />
                   <span className="text-xs text-white/40">ms</span>
                 </div>
               </div>
+            </div>
+          </div>
+
+          {/* Typing while you talk, and ending on silence. */}
+          <div className="space-y-2">
+            <Label className="text-xs uppercase tracking-wide text-white/50">
+              While you talk
+            </Label>
+
+            <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
+              <div className="pr-3">
+                <span className="text-sm text-white">Type each sentence as you finish it</span>
+                <p className="text-xs text-white/40">
+                  A pause ends the sentence, and it is typed while you say the
+                  next one. Typed text cannot be taken back, and the model
+                  reads each sentence on its own, so punctuation and the
+                  language it picks can differ from a whole recording.
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  const next = !liveTyping;
+                  setLiveTyping(next);
+                  invoke("set_live_typing", { enabled: next }).catch(() => {});
+                }}
+                className={`shrink-0 w-10 h-5 rounded-full transition-colors ${
+                  liveTyping ? "bg-green-500" : "bg-white/20"
+                }`}
+              >
+                <div
+                  className={`w-4 h-4 rounded-full bg-white transition-transform ${
+                    liveTyping ? "translate-x-5" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+
+            <div className={liveTyping ? "space-y-2" : "space-y-2 opacity-40"}>
+              <div className="flex items-center justify-between gap-3 p-3 bg-white/5 rounded-lg">
+                <div>
+                  <span className="text-sm text-white">Pause that ends a sentence</span>
+                  <p className="text-xs text-white/40">
+                    Shorter types sooner but cuts a sentence you only paused in.
+                  </p>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <Input
+                    type="number"
+                    min={300}
+                    max={10000}
+                    step={100}
+                    disabled={!liveTyping}
+                    value={livePauseMs}
+                    onChange={(e) => setLivePauseMs(e.target.value)}
+                    onBlur={() => saveMilliseconds(
+                      "set_live_pause_ms", livePauseMs, 700, setLivePauseMs
+                    )}
+                    className="w-20 h-8 bg-white/10 border-0 text-white text-sm text-right"
+                  />
+                  <span className="text-xs text-white/40">ms</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
+              <div className="pr-3">
+                <span className="text-sm text-white">Automatically stop after silence</span>
+                <p className="text-xs text-white/40">
+                  Ends the recording by itself when you stop talking. It waits
+                  twice your longest pause so far, never under 2 seconds and
+                  never over the limit below.
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  const next = !silenceStop;
+                  setSilenceStop(next);
+                  invoke("set_silence_stop", { enabled: next }).catch(() => {});
+                }}
+                className={`shrink-0 w-10 h-5 rounded-full transition-colors ${
+                  silenceStop ? "bg-green-500" : "bg-white/20"
+                }`}
+              >
+                <div
+                  className={`w-4 h-4 rounded-full bg-white transition-transform ${
+                    silenceStop ? "translate-x-5" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+
+            <div className={silenceStop ? "space-y-2" : "space-y-2 opacity-40"}>
+              <div className="flex items-center justify-between gap-3 p-3 bg-white/5 rounded-lg">
+                <div>
+                  <span className="text-sm text-white">Silence before auto-stopping dictation</span>
+                  <p className="text-xs text-white/40">
+                    The most it will wait. Also how long a recording nobody
+                    talks into lasts.
+                  </p>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <Input
+                    type="number"
+                    min={1000}
+                    max={60000}
+                    step={500}
+                    disabled={!silenceStop}
+                    value={silenceStopMs}
+                    onChange={(e) => setSilenceStopMs(e.target.value)}
+                    onBlur={() => saveMilliseconds(
+                      "set_silence_stop_ms", silenceStopMs, 3500, setSilenceStopMs
+                    )}
+                    className="w-20 h-8 bg-white/10 border-0 text-white text-sm text-right"
+                  />
+                  <span className="text-xs text-white/40">ms</span>
+                </div>
+              </div>
+            </div>
+
+            <div className={silenceStop ? "" : "opacity-40"}>
+              <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
+                <div className="pr-3">
+                  <span className="text-sm text-white">Resume when you keep talking</span>
+                  <p className="text-xs text-white/40">
+                    After an automatic stop the microphone stays on a moment.
+                    Speak again and the dictation carries on without the key.
+                  </p>
+                </div>
+                <button
+                  disabled={!silenceStop}
+                  onClick={() => {
+                    const next = !autoResume;
+                    setAutoResume(next);
+                    invoke("set_auto_resume", { enabled: next }).catch(() => {});
+                  }}
+                  className={`shrink-0 w-10 h-5 rounded-full transition-colors ${
+                    autoResume ? "bg-green-500" : "bg-white/20"
+                  }`}
+                >
+                  <div
+                    className={`w-4 h-4 rounded-full bg-white transition-transform ${
+                      autoResume ? "translate-x-5" : "translate-x-0.5"
+                    }`}
+                  />
+                </button>
+              </div>
+            </div>
+
+            <div className={silenceStop && autoResume ? "space-y-2" : "space-y-2 opacity-40"}>
+              <div className="flex items-center justify-between gap-3 p-3 bg-white/5 rounded-lg">
+                <div>
+                  <span className="text-sm text-white">How long it keeps listening</span>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <Input
+                    type="number"
+                    min={1000}
+                    max={30000}
+                    step={500}
+                    disabled={!silenceStop || !autoResume}
+                    value={autoResumeMs}
+                    onChange={(e) => setAutoResumeMs(e.target.value)}
+                    onBlur={() => saveMilliseconds(
+                      "set_auto_resume_ms", autoResumeMs, 6000, setAutoResumeMs
+                    )}
+                    className="w-20 h-8 bg-white/10 border-0 text-white text-sm text-right"
+                  />
+                  <span className="text-xs text-white/40">ms</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
+              <div className="pr-3">
+                <span className="text-sm text-white">Remove trailing dots and fillers</span>
+                <p className="text-xs text-white/40">
+                  A sentence cut while you hesitate comes back as "and then,
+                  uh, uh...". This drops the dots and the "uh" before typing.
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  const next = !tidyEnds;
+                  setTidyEnds(next);
+                  invoke("set_tidy_sentence_ends", { enabled: next }).catch(() => {});
+                }}
+                className={`shrink-0 w-10 h-5 rounded-full transition-colors ${
+                  tidyEnds ? "bg-green-500" : "bg-white/20"
+                }`}
+              >
+                <div
+                  className={`w-4 h-4 rounded-full bg-white transition-transform ${
+                    tidyEnds ? "translate-x-5" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
+              <div className="pr-3">
+                <span className="text-sm text-white">Press Enter when done</span>
+                <p className="text-xs text-white/40">
+                  Once the dictation is over and typed, Enter is pressed in the
+                  app you spoke into, which sends a chat message. Leave it off
+                  for documents.
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  const next = !autoEnter;
+                  setAutoEnter(next);
+                  invoke("set_auto_enter", { enabled: next }).catch(() => {});
+                }}
+                className={`shrink-0 w-10 h-5 rounded-full transition-colors ${
+                  autoEnter ? "bg-green-500" : "bg-white/20"
+                }`}
+              >
+                <div
+                  className={`w-4 h-4 rounded-full bg-white transition-transform ${
+                    autoEnter ? "translate-x-5" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
             </div>
           </div>
 

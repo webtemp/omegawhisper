@@ -1,6 +1,6 @@
 [package]
 name = "omegawhisper"
-version = "0.4.0"
+version = "0.5.1"
 description = "The most productive local-only speech to text program."
 authors = ["Deyan Danailov <webtemp@gmail.com>", "shenoy.ameya@gmail.com"]
 edition = "2021"
@@ -21,13 +21,13 @@ serde_json = "1"
 cpal = "0.15"
 chrono = "0.4"
 dirs = "5"
-zbus = "4"
+zbus = "5"
 # Downloads the model files.
 ureq = { version = "2", features = ["json"] }
 rubato = "0.15"
 clap = { version = "4", features = ["derive"] }
 # Multi-model local transcription
-transcribe-rs = { version = "0.3", features = ["onnx", "whisper-cpp"] }
+transcribe-rs = { version = "0.3", features = ["onnx", "whisper-cpp", "vad-silero"] }
 # Turns the recorded audio into the bars the windows draw. The windows used to
 # open the microphone themselves for this, which put the device into processed
 # mode and made macOS wind its gain up over the first seconds of every
@@ -47,6 +47,22 @@ version = "0.1"
 version = "1"
 features = ["sync", "rt-multi-thread", "macros", "time"]
 
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The dictation key on Wayland: the desktop's own GlobalShortcuts portal.
+# X11 key grabs cannot see keys under Wayland.
+ashpd = { version = "0.13", features = ["global_shortcuts"] }
+futures-util = "0.3"
+# The clipboard for pasting what ydotool cannot type. The clipboard plugin's
+# copy has no Wayland support and goes through XWayland, which a Wayland
+# terminal could not read from in time.
+arboard = { version = "3", features = ["wayland-data-control"] }
+# Puts the indicator on the overlay layer, where Wayland lets it be placed
+# and kept above everything without taking focus.
+gtk = "0.18"
+gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
+# Whisper on the GPU through Vulkan.
+transcribe-rs = { version = "0.3", features = ["whisper-vulkan"] }
 
 [target.'cfg(unix)'.dependencies]
 # Only for dup2, to point the app's own output at its log file.

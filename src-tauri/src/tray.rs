@@ -4,7 +4,81 @@
 use crate::AudioState;
 use std::thread;
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::{AppHandle, Manager, Wry};
+
+// The whole tray menu, built from scratch. Items added to a menu the panel
+// already holds never reach it on Linux, so a change to the list of
+// transcripts is made by building this again and handing it to the tray.
+#[cfg(desktop)]
+pub(crate) fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
+    let transcripts_item = crate::history::build_history_menu(app)?;
+
+    let settings_item = MenuItem::with_id(
+        app,
+        "open_settings_window",
+        "Settings...",
+        true,
+        None::<&str>,
+    )?;
+    let recordings_open =
+        MenuItem::with_id(app, "open_recordings", "Open Folder", true, None::<&str>)?;
+    let recordings_delete = MenuItem::with_id(
+        app,
+        "delete_recordings",
+        "Delete Recordings",
+        true,
+        None::<&str>,
+    )?;
+    let recordings_item = Submenu::with_items(
+        app,
+        "Recordings",
+        true,
+        &[&recordings_open, &recordings_delete],
+    )?;
+
+    // Live microphone numbers on the indicator and the line under the text.
+    // Useful when a dictation goes wrong, noise the rest of the time, so it
+    // stays off until asked for.
+    let saved_debug = app.state::<AudioState>().prefs().debug_stats;
+    let debug_item = CheckMenuItem::with_id(
+        app,
+        "debug_stats",
+        "Show debug stats",
+        true,
+        saved_debug,
+        None::<&str>,
+    )?;
+
+    let quit_item = MenuItem::with_id(app, "quit", "Quit Omegawhisper", true, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &transcripts_item,
+            &recordings_item,
+            &debug_item,
+            &settings_item,
+            &sep,
+            &quit_item,
+        ],
+    )?;
+
+    *app.state::<AudioState>().debug_menu_item.lock().unwrap() = Some(debug_item);
+    Ok(menu)
+}
+
+// Build the menu again and give it to the tray. Main thread only.
+#[cfg(desktop)]
+pub(crate) fn rebuild_menu(app: &AppHandle) -> tauri::Result<()> {
+    let menu = build_menu(app)?;
+    let state = app.state::<AudioState>();
+    let tray = state.tray_icon.lock().unwrap();
+    if let Some(tray) = tray.as_ref() {
+        tray.set_menu(Some(menu))?;
+    }
+    Ok(())
+}
 
 // Which picture the menu bar shows. One line to change; the frames for all
 // three are in the repo, so nothing has to be generated to switch.
@@ -56,15 +130,33 @@ pub(crate) fn tray_frames() -> &'static [&'static [u8]] {
     }
 }
 
+// One frame, decoded. macOS recolours the template to suit the menu bar; a
+// Linux panel draws the pixels as they are and is usually dark, so white.
+#[cfg(desktop)]
+pub(crate) fn tray_image(frame: usize) -> Option<tauri::image::Image<'static>> {
+    let bytes = tray_frames().get(frame)?;
+    let image = tauri::image::Image::from_bytes(bytes).ok()?;
+    if cfg!(target_os = "linux") {
+        let mut rgba = image.rgba().to_vec();
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel[0] = 255;
+            pixel[1] = 255;
+            pixel[2] = 255;
+        }
+        return Some(tauri::image::Image::new_owned(
+            rgba,
+            image.width(),
+            image.height(),
+        ));
+    }
+    Some(image.to_owned())
+}
+
 // Put one frame on the menu bar. Silent about failure on purpose: a picture
 // that will not decode is not a reason to interrupt a dictation.
 #[cfg(desktop)]
 pub(crate) fn show_tray_frame(app: &AppHandle, frame: usize) {
-    let frames = tray_frames();
-    let Some(bytes) = frames.get(frame) else {
-        return;
-    };
-    let Ok(image) = tauri::image::Image::from_bytes(bytes) else {
+    let Some(image) = tray_image(frame) else {
         return;
     };
     let state = app.state::<AudioState>();

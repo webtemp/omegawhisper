@@ -5,43 +5,116 @@
 <h1 align="center">Omegawhisper</h1>
 
 <p align="center">
-  Press one key anywhere on your Mac, speak, and the text is typed into whatever app you are in.
+  Press one key anywhere, speak, and the text is typed into whatever app you are in.
 </p>
 
 ---
 
-> ### On Linux? Use [hyperwhisper](https://github.com/hyperwhisper/app) instead.
->
-> This is a fork of [**hyperwhisper**](https://github.com/hyperwhisper/app). Everything
-> good here started there. The only reason this fork exists is to make dictation good on
-> macOS, so all the work goes into the Mac side. The Linux code is inherited from
-> upstream, left untouched, and **never tested here** — on Linux you would be running an
-> out-of-date copy of the original with no benefit. Go to upstream.
-
 ## What it does
 
-Omegawhisper sits in your menu bar. It has no Dock icon and no window in your way.
-Press **F3**, speak, press **F3** again. A small spectrogram shows it is listening, and
-the text is typed into the app you were already using. F3 is only the default — pick any
-key in Settings.
+Omegawhisper sits in your menu bar or system tray. It has no Dock icon and no window in
+your way. Press **F3**, speak, press **F3** again. A small spectrogram shows it is
+listening, and the text is typed into the app you were already using. F3 is only the
+default — pick any key.
 
-Transcription runs three ways:
-
-| Backend | Where it runs | Speed |
-|---|---|---|
-| **Local** (Whisper, Parakeet, Moonshine) | Your Mac, on the GPU. Offline, nothing leaves the machine | Transcribes after you stop |
-| **Hyperwhisper server** | The upstream project's hosted service | Text appears while you speak |
-| **Deepgram** | Deepgram, with your own API key | Text appears while you speak |
+Everything runs on your machine. Whisper, Parakeet and Moonshine models are downloaded
+once and run locally, on the GPU where that helps. Nothing is sent anywhere, there is no
+account and no server.
 
 ### Features
 
-- One global shortcut, works in any app. **F3** by default, changeable in Settings
-- Types into other apps with Unicode key events
-- Local models run on the Mac GPU (Metal + CoreML)
+- One global shortcut, works in any app. **F3** by default
+- macOS (Apple Silicon) and Linux (Wayland or X11)
+- Types into other apps: Unicode key events on macOS, `ydotool`/`wtype`/`xdotool` on Linux
+- Local models on the GPU: Metal and CoreML on the Mac, Vulkan on Linux
 - Spectrogram indicator window while you speak
-- Recordings saved as WAV, and deletable from the menu bar
-- Silence is never sent to the model, so it cannot invent text from a quiet room
+- Recordings saved as WAV, and deletable from the tray menu
+- Silence is never sent to the model, so it cannot invent text from a quiet room. Speech is recognised by Silero VAD, so a quiet microphone works as well as a loud one
 - Dark theme
+
+## Install (Linux)
+
+Tested on Arch Linux with KDE Plasma 6 on Wayland and an AMD GPU. Other desktops work as
+far as they offer the same freedesktop pieces, listed below.
+
+### 1. Packages
+
+```sh
+sudo pacman -S --needed webkit2gtk-4.1 gtk-layer-shell libappindicator-gtk3 \
+    ydotool wtype xdg-desktop-portal vulkan-headers shaderc cmake clang bun rustup
+```
+
+Or `./scripts/install-linux.sh`, which runs that, builds, installs into `~/.local/bin`,
+and starts the `ydotool` service.
+
+What each one is for:
+
+| Package | Why |
+|---|---|
+| `webkit2gtk-4.1`, `libappindicator-gtk3` | The two small windows, and the tray icon |
+| `gtk-layer-shell` | Puts the indicator at the bottom of the screen on Wayland. Without it Wayland decides where the window goes |
+| `xdg-desktop-portal` plus your desktop's backend (`xdg-desktop-portal-kde`, `-gnome`, `-hyprland`…) | The dictation key on Wayland |
+| `ydotool` | Types the text, on any compositor, through a virtual keyboard. Anything outside ASCII is pasted instead, since its keymap cannot type it |
+| `wtype` | Tried first on Wayland: it types any character directly. KWin does not offer it the protocol it needs, so on KDE it is skipped |
+| `vulkan-headers`, `shaderc` | Build Whisper for the GPU. Only at build time |
+| `cmake`, `clang` | Build whisper.cpp |
+
+On Debian or Ubuntu the names differ: `libwebkit2gtk-4.1-dev`, `libgtk-layer-shell-dev`,
+`libayatana-appindicator3-dev`, `ydotool`, `wtype`, `libvulkan-dev`, `glslc`, plus `bun`
+from [bun.sh](https://bun.sh) and Rust from [rustup.rs](https://rustup.rs).
+
+### 2. Build and install
+
+```sh
+git clone https://github.com/webtemp/omegawhisper.git
+cd omegawhisper
+bun install
+bun run tauri build --no-bundle
+install -Dm755 src-tauri/target/release/omegawhisper ~/.local/bin/omegawhisper
+```
+
+The first build compiles whisper.cpp, its Vulkan shaders and ONNX Runtime and takes a
+while. Later builds are much faster. `bun run tauri build` without `--no-bundle` also
+produces `.deb`, `.rpm` and `.AppImage` files under `src-tauri/target/release/bundle/`.
+
+### 3. Let it type
+
+`ydotool` needs its service running and your user in the `input` group:
+
+```sh
+systemctl --user enable --now ydotool
+sudo usermod -aG input "$USER"    # log out and in again afterwards
+```
+
+### 4. Run it and say yes to the key
+
+```sh
+omegawhisper
+```
+
+At startup the app writes `~/.local/share/applications/dev.omegawhisper.desktop`, so it
+shows up in your launcher, and asks the desktop for **F3** through the GlobalShortcuts
+portal. KDE and GNOME show a dialog once — *Omegawhisper wants to register the following
+shortcut: Start or stop dictation, F3* — press **OK**. After that the desktop remembers
+the key, under System Settings → Keyboard → Shortcuts → Omegawhisper, which is also where
+you change it; the **Change...** button in Settings opens that page. On an X11 session
+the app grabs the key itself and Settings → Dictation key → Change picks another.
+
+Then open **Settings** from the tray icon, download **Whisper Turbo**, and press F3.
+
+Start at login is the switch in Settings; it writes `~/.config/autostart/omegawhisper.desktop`.
+
+### Without a portal
+
+If your compositor has no GlobalShortcuts portal, bind this to a key in it:
+
+```sh
+omegawhisper transcribe toggle
+```
+
+It reaches the running app over D-Bus (`dev.omegawhisper` at `/dev/omegawhisper`, method
+`toggle_recording`). Sway, i3 and everything else that can run a command on a key work
+this way.
 
 ## Install (macOS)
 
@@ -184,8 +257,7 @@ accurate but noticeably slower. Parakeet and Moonshine are English only.
 
 Models are 80 MB to 1.6 GB, so the first download takes a moment.
 
-The microphone is always the system default input. The device list in Settings is Linux
-code and does nothing on macOS; change the input in System Settings → Sound.
+The microphone defaults to the system input; Settings → Microphone picks another.
 
 ## Using it
 
@@ -217,8 +289,12 @@ One minute of speech, on an M2 Pro:
 | Parakeet v3 | **off** | 6.8 s | **1.9 s** |
 | Moonshine Base | **off** | 2.6 s | **1.7 s** |
 
-Whisper runs on whisper.cpp through Metal. Parakeet and Moonshine run on ONNX
-Runtime through CoreML. They are separate, so one switch cannot serve both.
+Whisper runs on whisper.cpp through Metal on the Mac and Vulkan on Linux. Parakeet and
+Moonshine run on ONNX Runtime through CoreML on the Mac; the Linux build has no GPU
+runtime for them, so there the second switch changes nothing. They are separate, so one
+switch cannot serve both.
+
+On Linux, an RX 9070 XT transcribed 13 seconds of speech with Whisper Turbo in 0.6 s.
 
 The reason the second one loses: those models are quantised to 8-bit integers,
 which CoreML handles poorly — it hands parts back to the processor and pays for
@@ -234,26 +310,27 @@ cargo test --manifest-path src-tauri/Cargo.toml --release -- --ignored --nocaptu
 It times every model you have downloaded, both ways, and prints which won for
 each. Either switch takes effect on the next dictation.
 
-The menu-bar icon has:
+The menu-bar or tray icon has:
 
 | Item | What it does |
 |---|---|
-| Open window | Shows the main window: text, waveform, playback |
-| Hide window | Puts it away again, back to menu bar only |
-| Recordings → Open Folder | `~/Library/Application Support/omegawhisper/recordings` |
+| Recordings → Open Folder | `~/Library/Application Support/omegawhisper/recordings` on the Mac, `~/.local/share/omegawhisper/recordings` on Linux |
 | Recordings → Delete Recordings | Deletes every saved WAV. Asks first |
 | Show debug stats | Live microphone numbers, and a line of numbers under each result. Also in Settings |
-| Settings | Dictation key, backend, model, trial key |
+| Settings | Dictation key, microphone, models, graphics card, startup |
 | Quit | Quits |
 
 ## Troubleshooting
 
-**Nothing happens when I press the key.** Another app has taken it, or Accessibility is
-off. Open the main window — startup problems appear there as a message. Pick a different
-key in Settings → Dictation key.
+**Nothing happens when I press the key.** On the Mac, another app has taken it or
+Accessibility is off. On Linux under Wayland, the desktop was told no in the dialog, or the
+key is taken: System Settings → Keyboard → Shortcuts → Omegawhisper shows what it holds.
+Startup problems appear on the indicator as a message when the app starts.
 
-**Text is transcribed but never typed.** Accessibility. If you rebuilt the app, the grant
-is gone even though the checkbox still looks on: reset it (step 5).
+**Text is transcribed but never typed.** On the Mac: Accessibility. If you rebuilt the app,
+the grant is gone even though the checkbox still looks on: reset it (step 5). On Linux:
+`ydotool` is missing or its service is not running. The text is put on the clipboard
+instead, and the log says which tool failed and why.
 
 **The build says `failed to run 'cargo metadata'` / `No such file or directory (os error 2)`.**
 That means the build cannot find `cargo`. Two different causes:
@@ -266,6 +343,17 @@ Nothing found at all — Rust is not installed, do step 1. Found in `~/.cargo/bi
 says nothing — it is installed and your terminal is just too old to see it, so open a new
 one or run `source "$HOME/.cargo/env"`.
 
+**"These seconds held no speech" while I was talking.** Speech is recognised by a small
+model (Silero VAD) that listens to the shape of the sound, not its loudness, so a quiet
+microphone is fine: a headset delivering a fiftieth of normal level is still heard. If
+you get this anyway, the microphone is not reaching the app at all, or almost: check it
+is the one chosen under Settings → Microphone, and that nothing else is holding it. The
+Boost slider there multiplies the signal by 0.5 to 100 for a microphone that is merely
+quiet or too hot; the app already scales speech to a normal level before Whisper hears it.
+
+**I spoke Bulgarian and got English.** Settings → Language. "As spoken" lets Whisper detect the
+language; choosing one tells Whisper outright and gets better punctuation in it.
+
 **The app freezes for a second after I stop.** Expected with local models. They transcribe
 after the recording ends, not during.
 
@@ -274,7 +362,8 @@ they reach the model, so this should not happen. If it does, the log line for th
 dictation shows the loudness it measured.
 
 **Anything else.** The log is at
-`~/Library/Application Support/omegawhisper/omegawhisper.log`. Switch on **Show debug
+`~/Library/Application Support/omegawhisper/omegawhisper.log` on the Mac and
+`~/.local/share/omegawhisper/omegawhisper.log` on Linux. Switch on **Show debug
 stats**, in the menu bar or in Settings, to get live microphone numbers and a line of
 numbers per dictation.
 
@@ -299,6 +388,7 @@ src-tauri/src/
   analysis.rs              loudness, frequency bands, pitch, trimming, WAV
   settings.rs              the settings file; microphone.rs  input devices
   indicator.rs  chime.rs  tray.rs  shortcut.rs  typing.rs  storage.rs
+  linux.rs                 desktop file, portal dictation key, layer-shell indicator
   managers/model.rs        model list, download, delete
   managers/transcription.rs  loads a model, runs transcribe-rs
 src-tauri/icons/           app icon and menu-bar frames, all committed
@@ -306,83 +396,8 @@ src-tauri/icons/           app icon and menu-bar frames, all committed
 
 **Tech stack:** React 19, TypeScript, Tailwind CSS 4, shadcn/ui, Rust, Tauri v2, cpal.
 
-## Linux
-
-<details>
-<summary>Inherited from upstream and never tested here — expand only if you know what you are doing</summary>
-
-Really, use [hyperwhisper](https://github.com/hyperwhisper/app). Nothing below has been
-run since the fork.
-
-### Requirements
-
-- PipeWire or PulseAudio for audio capture
-- `ydotool` (Wayland) or `xdotool` (X11) for auto-type
-
-### Enabling auto-type
-
-Make sure `/dev/uinput` is owned by the `root` user and the `input` group:
-
-```sh
-sudo tee /etc/udev/rules.d/99-uinput.rules << 'EOF'
-KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
-EOF
-sudo udevadm trigger --name-match=uinput
-```
-
-Create a `ydotoold` user service and enable it:
-
-```sh
-mkdir -p ~/.config/systemd/user/
-cat > ~/.config/systemd/user/ydotoold.service << 'EOF'
-[Unit]
-Description=ydotoold daemon
-
-[Service]
-ExecStart=/usr/bin/ydotoold
-Restart=always
-
-[Install]
-WantedBy=default.target
-EOF
-
-systemctl --user enable --now ydotoold.service
-```
-
-Add your user to the `input` group:
-
-```sh
-sudo usermod -aG input $USER
-```
-
-### Building
-
-```sh
-bun install
-bun run tauri build # .deb, .rpm, .AppImage in src-tauri/target/release/bundle/
-nix build           # NixOS
-```
-
-`nix-shell` or `flake.nix` gives a dev environment.
-
-### Global shortcut
-
-There is no built-in shortcut on Linux. Bind this to a key in your desktop environment:
-
-```sh
-omegawhisper transcribe toggle
-```
-
-Or over D-Bus:
-
-```sh
-dbus-send --session --type=method_call \
-  --dest=dev.omegawhisper \
-  /dev/omegawhisper \
-  dev.omegawhisper.toggle_recording
-```
-
-</details>
+`flake.nix` and `shell.nix` predate the Linux work and have not been run since; the
+packages listed under Install (Linux) are the tested path.
 
 ## License
 
@@ -391,5 +406,5 @@ dbus-send --session --type=method_call \
 - Copyright (C) 2026 Ameya Shenoy &lt;shenoy.ameya@gmail.com&gt;
 - Copyright (C) 2026 Deyan Danailov &lt;webtemp@gmail.com&gt;
 
-A modified fork of [hyperwhisper](https://github.com/hyperwhisper/app).
-Modifications by Deyan Danailov, mainly macOS improvements.
+Started in 2026 as a fork of Ameya Shenoy's hyperwhisper and rewritten since: local-only,
+no main window, its own recording pipeline, and macOS and Linux desktop integration.

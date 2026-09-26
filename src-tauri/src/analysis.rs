@@ -35,12 +35,19 @@ pub(crate) const BAND_COUNT: usize = 64;
 
 // Loudness per frequency band, for the bars the windows draw.
 //
-// The bands are spaced logarithmically, so the voice range fills the width
-// instead of being squeezed into the left edge, and the result is in decibels,
-// because that is how loudness is heard. -90 dB comes out as 0 and -20 dB as 1.
+// The bands cover 80 Hz to 8 kHz, where a voice lives, spaced
+// logarithmically so the voice range fills the width instead of being
+// squeezed into the left edge. Each band averages every bin inside it, and
+// the upper bands are tilted up: a voice has far less energy above a few
+// hundred hertz, and without the tilt the right half of the picture never
+// moved. The result is in decibels, because that is how loudness is heard:
+// -75 dB comes out as 0 and -20 dB as 1. The sound arrives scaled so its
+// peak sits near the top, so a wider window than this only flattened the
+// picture into a row of tall bars.
 pub(crate) fn frequency_bands(
     samples: &[f32],
     fft: &std::sync::Arc<dyn rustfft::Fft<f32>>,
+    sample_rate: u32,
 ) -> Vec<f32> {
     use rustfft::num_complex::Complex;
 
@@ -63,17 +70,32 @@ pub(crate) fn frequency_bands(
     fft.process(&mut buffer);
 
     let bins = FFT_SIZE / 2;
-    let min_bin = 2.0f32;
-    let max_bin = (bins as f32) * 0.5;
+    let hz_per_bin = sample_rate as f32 / FFT_SIZE as f32;
+    const LOW_HZ: f32 = 80.0;
+    const HIGH_HZ: f32 = 8_000.0;
+    // Above this the tilt starts, at this many decibels per octave.
+    const TILT_FROM_HZ: f32 = 300.0;
+    const TILT_DB_PER_OCTAVE: f32 = 4.5;
+    let high_hz = HIGH_HZ.min(sample_rate as f32 / 2.0 - hz_per_bin);
+    let edge = |pos: f32| LOW_HZ * (high_hz / LOW_HZ).powf(pos);
 
     (0..BAND_COUNT)
         .map(|i| {
-            let pos = i as f32 / (BAND_COUNT - 1) as f32;
-            let bin = (min_bin * (max_bin / min_bin).powf(pos)).round() as usize;
-            let bin = bin.min(bins - 1);
-            let magnitude = buffer[bin].norm() / (bins as f32);
-            let db = 20.0 * (magnitude + 1e-9).log10();
-            ((db + 90.0) / 70.0).clamp(0.0, 1.0)
+            let from_hz = edge(i as f32 / BAND_COUNT as f32);
+            let to_hz = edge((i + 1) as f32 / BAND_COUNT as f32);
+            let first = ((from_hz / hz_per_bin).round() as usize).clamp(1, bins - 1);
+            let last = ((to_hz / hz_per_bin).round() as usize).clamp(first, bins - 1);
+            let power: f32 = (first..=last).map(|b| buffer[b].norm_sqr()).sum::<f32>()
+                / (last - first + 1) as f32;
+            let magnitude = power.sqrt() / bins as f32;
+            let centre_hz = (from_hz * to_hz).sqrt();
+            let tilt = if centre_hz > TILT_FROM_HZ {
+                TILT_DB_PER_OCTAVE * (centre_hz / TILT_FROM_HZ).log2()
+            } else {
+                0.0
+            };
+            let db = 20.0 * (magnitude + 1e-9).log10() + tilt;
+            ((db + 75.0) / 55.0).clamp(0.0, 1.0)
         })
         .collect()
 }
@@ -160,6 +182,18 @@ pub(crate) fn u16_to_f32(sample: u16) -> f32 {
 }
 
 // Stereo arrives as left, right, left, right.
+// The microphone boost setting. Applied to the raw samples so the meters,
+// the saved WAV and the speech check all see the same louder signal. Clipped
+// at full scale rather than allowed to wrap.
+pub(crate) fn boost_samples(buffer: &mut [f32], boost: f32) {
+    if boost == 1.0 {
+        return;
+    }
+    for sample in buffer.iter_mut() {
+        *sample = (*sample * boost).clamp(-1.0, 1.0);
+    }
+}
+
 pub(crate) fn mix_to_mono(buffer: Vec<f32>, channels: u16) -> Vec<f32> {
     if channels <= 1 {
         return buffer;
@@ -401,14 +435,15 @@ pub(crate) fn boost_quiet_audio(samples: &mut [f32]) -> f32 {
     const TARGET_LEVEL: f32 = 0.08;
     // Leave headroom so the loudest sample does not hit the ceiling.
     const MAX_PEAK: f32 = 0.95;
-    // Past this the recording is being turned into something it was not.
-    // 40x used to be allowed, and it raised an empty room to speech loudness,
-    // which Whisper then read as sentences in Dutch.
-    const MAX_GAIN: f32 = 10.0;
+    // The speech detector has already said there are words in here, so
+    // however quiet they are they get raised. The peak still caps the gain.
+    // This used to stop at 10x and refuse anything under the old loudness
+    // floor, which left a quiet headset's words at a fiftieth of normal.
+    const MAX_GAIN: f32 = 100.0;
 
     let level = speech_level(samples);
     let peak = samples.iter().fold(0.0f32, |max, s| max.max(s.abs()));
-    if level < MIN_SPEECH_LEVEL || peak <= 0.0 {
+    if level <= 0.0 || peak <= 0.0 {
         return 1.0;
     }
 

@@ -25,8 +25,7 @@ dist-ssr
 # nix
 result
 
-# Phone icons. This fork builds for macOS only, so they are not kept and no
-# build reads them. Everything the app does use is committed under
-# src-tauri/icons/.
+# Phone icons. The app is desktop only, so they are not kept and no build
+# reads them. Everything the app does use is committed under src-tauri/icons/.
 src-tauri/icons/android/
 src-tauri/icons/ios/
