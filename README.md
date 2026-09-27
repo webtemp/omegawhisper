@@ -297,6 +297,9 @@ asks before installing it. That request is the only thing the app ever sends any
 - **The log** is `%LOCALAPPDATA%\omegawhisper\omegawhisper.log`. Paste that into the
   Explorer address bar. It starts over when it reaches 5 MB, so copy it soon after a failure.
 - **Recordings** are next to it, in `%LOCALAPPDATA%\omegawhisper\recordings`.
+- **"F3 could not be registered"** on the indicator at startup means another program holds
+  F3. Pick a different key in Settings, or close that program. Starting Omegawhisper a
+  second time no longer does this: it opens Settings in the running copy instead.
 - **When something fails,** send the log, what you pressed and said, the app you were typing
   into, your Windows version (`winver`) and graphics card. Switch on **Show debug stats** in
   the tray menu first: it puts a line of numbers for every dictation into the log.
