@@ -28,10 +28,10 @@ pub(crate) fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         )?)?;
     }
 
-    let settings_item = MenuItem::with_id(
+    let all_settings = MenuItem::with_id(
         app,
         "open_settings_window",
-        "Settings...",
+        "All Settings...",
         true,
         None::<&str>,
     )?;
@@ -64,15 +64,21 @@ pub(crate) fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         None::<&str>,
     )?;
 
+    // The quick settings, and the window with all of them.
+    let settings_item = Submenu::with_items(
+        app,
+        "Settings",
+        true,
+        &[&language_item, &debug_item, &all_settings],
+    )?;
+
     let quit_item = MenuItem::with_id(app, "quit", "Quit Omegawhisper", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(
         app,
         &[
             &transcripts_item,
-            &language_item,
             &recordings_item,
-            &debug_item,
             &settings_item,
             &sep,
             &quit_item,

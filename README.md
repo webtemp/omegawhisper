@@ -359,11 +359,11 @@ The menu-bar or tray icon has:
 
 | Item | What it does |
 |---|---|
-| Language | The language spoken, "As spoken" lets Whisper detect it. Also in Settings |
 | Recordings → Open Folder | `~/Library/Application Support/omegawhisper/recordings` on the Mac, `~/.local/share/omegawhisper/recordings` on Linux, `%LOCALAPPDATA%\omegawhisper\recordings` on Windows |
 | Recordings → Delete Recordings | Deletes every saved WAV. Asks first |
-| Show debug stats | Live microphone numbers, and a line of numbers under each result. Also in Settings |
-| Settings | Dictation key, microphone, models, graphics card, startup |
+| Settings → Language | The language spoken; "As spoken" lets Whisper detect it |
+| Settings → Show debug stats | Live microphone numbers, and a line of numbers under each result |
+| Settings → All Settings... | The window: dictation key, microphone, models, graphics card, startup, and the two above |
 | Quit | Quits |
 
 ## Troubleshooting
