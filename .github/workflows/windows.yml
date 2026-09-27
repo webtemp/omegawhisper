@@ -1,0 +1,87 @@
+name: Windows
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # bindgen, for whisper.cpp's headers. LLVM ships on the runner image.
+  LIBCLANG_PATH: C:\Program Files\LLVM\bin
+  # whisper.cpp builds its shader generator as a nested CMake project that
+  # finds the compiler through the environment, which the Visual Studio
+  # generator does not provide. Ninja inside the MSVC developer shell does.
+  CMAKE_GENERATOR: Ninja
+  # Windows caps object-file paths at 250 characters and the shader
+  # generator's build directory sits 240 deep under target/; build short.
+  CARGO_TARGET_DIR: D:\a\t
+  # whisper.cpp tunes for the CPU that builds it, and the runner has AVX-512
+  # that most PCs lack: an illegal-instruction crash at startup. Off means
+  # the AVX2 baseline, which every CPU Windows 11 runs on has.
+  GGML_NATIVE: "OFF"
+
+jobs:
+  check:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The cache ignores CARGO_TARGET_DIR; this resolves to D:\a\t.
+          workspaces: src-tauri -> ../../../t
+      - uses: oven-sh/setup-bun@v2
+      - uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.4.357.0
+          install_runtime: true
+          cache: true
+      - run: bun install --frozen-lockfile
+      # generate_context! embeds the frontend, so it has to exist first.
+      - run: bun run build
+      - run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The cache ignores CARGO_TARGET_DIR; this resolves to D:\a\t.
+          workspaces: src-tauri -> ../../../t
+      - uses: oven-sh/setup-bun@v2
+      - uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.4.357.0
+          install_runtime: true
+          cache: true
+      - run: bun install --frozen-lockfile
+      # Builds the NSIS installer and uploads it to the release for this tag.
+      # With the TAURI_SIGNING_PRIVATE_KEY secret set it also signs the
+      # installer for the updater and uploads latest.json; without it the
+      # release is a plain installer that running copies will not offer.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # Add TAURI_SIGNING_PRIVATE_KEY_PASSWORD here if the key gets one.
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Omegawhisper ${{ github.ref_name }}
+          releaseBody: Windows installer below. See README, Install (Windows).
+          releaseDraft: false
+          # A tag like v0.6.0-rc.1 is a prerelease: the updater ignores those.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          uploadUpdaterJson: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          args: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && '--config src-tauri/tauri.updater.conf.json' || '' }}

@@ -175,7 +175,7 @@ export function SettingsPage() {
     whisper_gpu: "Metal",
     onnx_gpu: "CoreML",
   });
-  const where = platform.os === "linux" ? "system tray" : "menu bar";
+  const where = platform.os === "macos" ? "menu bar" : "system tray";
   const [showAllModels, setShowAllModels] = useState(false);
 
   // Disable right-click context menu
@@ -291,6 +291,14 @@ export function SettingsPage() {
       invoke<string>("get_shortcut").then(setShortcut).catch(() => {});
     load();
     const unlisten = listen("shortcut-changed", load);
+    return () => {
+      unlisten.then((fn) => fn()).catch(() => {});
+    };
+  }, []);
+
+  // The tray menu changes it too.
+  useEffect(() => {
+    const unlisten = listen<string>("language-changed", (event) => setLanguage(event.payload));
     return () => {
       unlisten.then((fn) => fn()).catch(() => {});
     };

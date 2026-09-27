@@ -14,10 +14,24 @@ use tauri::{AppHandle, Manager, Wry};
 pub(crate) fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let transcripts_item = crate::history::build_history_menu(app)?;
 
-    let settings_item = MenuItem::with_id(
+    // The language, one tick. Whisper follows it from the next dictation.
+    let chosen = app.state::<AudioState>().prefs().language;
+    let language_item = Submenu::with_id(app, "language", "Language", true)?;
+    for (code, name) in crate::settings::LANGUAGES {
+        language_item.append(&CheckMenuItem::with_id(
+            app,
+            format!("{}{}", crate::settings::LANGUAGE_MENU_ID, code),
+            name,
+            true,
+            chosen == code,
+            None::<&str>,
+        )?)?;
+    }
+
+    let all_settings = MenuItem::with_id(
         app,
         "open_settings_window",
-        "Settings...",
+        "All Settings...",
         true,
         None::<&str>,
     )?;
@@ -50,6 +64,14 @@ pub(crate) fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         None::<&str>,
     )?;
 
+    // The quick settings, and the window with all of them.
+    let settings_item = Submenu::with_items(
+        app,
+        "Settings",
+        true,
+        &[&language_item, &debug_item, &all_settings],
+    )?;
+
     let quit_item = MenuItem::with_id(app, "quit", "Quit Omegawhisper", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(
@@ -57,7 +79,6 @@ pub(crate) fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         &[
             &transcripts_item,
             &recordings_item,
-            &debug_item,
             &settings_item,
             &sep,
             &quit_item,
@@ -130,18 +151,56 @@ pub(crate) fn tray_frames() -> &'static [&'static [u8]] {
     }
 }
 
-// One frame, decoded. macOS recolours the template to suit the menu bar; a
-// Linux panel draws the pixels as they are and is usually dark, so white.
+// The grey the frame's black is turned into, where the panel draws the pixels
+// as they are. macOS recolours the template itself; a Linux panel is usually
+// dark, so white; Windows says which its taskbar is.
+#[cfg(desktop)]
+fn tray_colour() -> Option<u8> {
+    #[cfg(target_os = "linux")]
+    return Some(255);
+    #[cfg(windows)]
+    return Some(if taskbar_is_light() { 0 } else { 255 });
+    #[cfg(target_os = "macos")]
+    None
+}
+
+// SystemUsesLightTheme is the taskbar and tray; AppsUseLightTheme, next to
+// it, is the windows. Missing or unreadable counts as dark, the default.
+#[cfg(windows)]
+fn taskbar_is_light() -> bool {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+        .encode_utf16()
+        .collect();
+    let value: Vec<u16> = "SystemUsesLightTheme\0".encode_utf16().collect();
+    let mut data: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            &mut data as *mut u32 as *mut _,
+            &mut size,
+        )
+    };
+    status == ERROR_SUCCESS && data == 1
+}
+
+// One frame, decoded and, where the panel needs it, recoloured.
 #[cfg(desktop)]
 pub(crate) fn tray_image(frame: usize) -> Option<tauri::image::Image<'static>> {
     let bytes = tray_frames().get(frame)?;
     let image = tauri::image::Image::from_bytes(bytes).ok()?;
-    if cfg!(target_os = "linux") {
+    if let Some(grey) = tray_colour() {
         let mut rgba = image.rgba().to_vec();
-        for pixel in rgba.chunks_exact_mut(4) {
-            pixel[0] = 255;
-            pixel[1] = 255;
-            pixel[2] = 255;
+        for pixel in rgba.as_chunks_mut::<4>().0 {
+            pixel[0] = grey;
+            pixel[1] = grey;
+            pixel[2] = grey;
         }
         return Some(tauri::image::Image::new_owned(
             rgba,

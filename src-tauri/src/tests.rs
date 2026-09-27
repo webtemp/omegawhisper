@@ -1389,7 +1389,9 @@ fn deleting_recordings_removes_only_recordings() {
 fn read_model_input(path: &std::path::Path) -> Vec<f32> {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
     bytes[44..]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / i16::MAX as f32)
         .collect()
 }
@@ -1909,11 +1911,15 @@ fn wav_samples_16k(path: &std::path::Path) -> Vec<f32> {
     };
     let samples: Vec<f32> = match (format, bits) {
         (3, 32) => data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         (1, 16) => data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
             .collect(),
         other => panic!("unsupported wav format {:?}", other),
@@ -2044,7 +2050,51 @@ fn a_dead_microphone_and_a_silent_room_are_told_apart() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+mod language_menu {
+    use crate::settings::{language_from_menu_id, LANGUAGES, LANGUAGE_MENU_ID};
+
+    #[test]
+    fn every_language_has_a_menu_id_that_reads_back_and_nothing_else_does() {
+        for (code, _) in LANGUAGES {
+            assert_eq!(
+                language_from_menu_id(&format!("{}{}", LANGUAGE_MENU_ID, code)),
+                Some(code)
+            );
+        }
+        assert_eq!(language_from_menu_id("language:klingon"), None);
+        assert_eq!(language_from_menu_id("transcript:0"), None);
+        assert_eq!(language_from_menu_id("quit"), None);
+    }
+}
+
+mod unicode_typing {
+    use crate::typing::{utf16_chunks, CHUNK_UTF16_UNITS};
+
+    // What the Mac and Windows send as key events: short pieces, whole
+    // characters, nothing lost.
+    #[test]
+    fn the_pieces_are_short_whole_and_add_back_up_to_the_text() {
+        let text = "Здравей, свят! 👋🏽 emoji at 19: 🎉x and a line\nbreak; the end 🙂";
+        let chunks = utf16_chunks(text);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(!chunk.is_empty() && chunk.len() <= CHUNK_UTF16_UNITS);
+            assert!(
+                !(0xD800..0xDC00).contains(chunk.last().unwrap()),
+                "a piece must not end on the first half of a pair"
+            );
+            assert!(
+                !(0xDC00..0xE000).contains(chunk.first().unwrap()),
+                "or start on the second half"
+            );
+        }
+        let joined: Vec<u16> = chunks.concat();
+        assert_eq!(String::from_utf16(&joined).unwrap(), text);
+        assert!(utf16_chunks("").is_empty());
+    }
+}
+
+#[cfg(target_os = "linux")]
 mod typing_tools {
     use crate::typing::{needs_paste, tool_order};
 
@@ -2159,7 +2209,12 @@ fn transcript(text: &str) -> Transcript {
 fn the_newest_transcript_is_first_and_the_list_stays_at_twenty() {
     let mut list = Vec::new();
     for i in 0..25 {
-        remember(&mut list, transcript(&format!("dictation {i}")), false, HISTORY_LIMIT);
+        remember(
+            &mut list,
+            transcript(&format!("dictation {i}")),
+            false,
+            HISTORY_LIMIT,
+        );
     }
     assert_eq!(list.len(), HISTORY_LIMIT);
     assert_eq!(list[0].text, "dictation 24", "newest first");
@@ -2185,9 +2240,16 @@ fn a_dictation_picked_up_after_a_silence_stop_joins_the_previous_entry() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].text, "First part. Second part.");
     remember(&mut list, transcript("Second part."), true, HISTORY_LIMIT);
-    assert_eq!(list[0].text, "First part. Second part. Second part.", "a continuation is never folded as a repeat");
+    assert_eq!(
+        list[0].text, "First part. Second part. Second part.",
+        "a continuation is never folded as a repeat"
+    );
     remember(&mut list, transcript("Only part."), true, HISTORY_LIMIT);
-    assert_eq!(list.len(), 1, "with nothing before it, continuing is just adding");
+    assert_eq!(
+        list.len(),
+        1,
+        "with nothing before it, continuing is just adding"
+    );
     let mut empty = Vec::new();
     remember(&mut empty, transcript("Only part."), true, HISTORY_LIMIT);
     assert_eq!(empty.len(), 1);
@@ -2205,7 +2267,10 @@ fn a_menu_label_is_one_short_line_with_the_time() {
     assert_eq!(label, "26 Sep 14:32  line one line two tabbed");
 
     let label = menu_label(&transcript("this & that"));
-    assert_eq!(label, "26 Sep 14:32  this && that", "& is a mnemonic in a menu label");
+    assert_eq!(
+        label, "26 Sep 14:32  this && that",
+        "& is a mnemonic in a menu label"
+    );
 
     let label = menu_label(&transcript("Здравей, свят"));
     assert_eq!(label, "26 Sep 14:32  Здравей, свят");
@@ -2219,7 +2284,6 @@ fn the_transcript_history_survives_being_written_and_read_back() {
     assert_eq!(loaded, list);
     assert!(serde_json::from_str::<Vec<Transcript>>("not json").is_err());
 }
-
 
 // ---- typing while you talk ----------------------------------------------
 
@@ -2250,17 +2314,29 @@ fn live_settings_start_switched_on() {
     assert!(!prefs.auto_enter);
     assert!(prefs.tidy_sentence_ends);
     let old: Prefs = serde_json::from_str(r#"{"pause_shortening":true}"#).unwrap();
-    assert!(old.live_typing, "a file from before live typing gets it too");
+    assert!(
+        old.live_typing,
+        "a file from before live typing gets it too"
+    );
     assert!(old.silence_stop);
     assert_eq!(old.silence_stop_ms, 3500);
 }
 
 #[test]
 fn a_soft_syllable_does_not_end_speech_but_a_soft_noise_does_not_start_it() {
-    assert!(!still_speech(false, 0.4), "below the start line: not speech");
+    assert!(
+        !still_speech(false, 0.4),
+        "below the start line: not speech"
+    );
     assert!(still_speech(false, 0.5), "on it: speech starts");
-    assert!(still_speech(true, 0.35), "once started, a softer frame keeps it");
-    assert!(!still_speech(true, 0.25), "until it drops under the hold line");
+    assert!(
+        still_speech(true, 0.35),
+        "once started, a softer frame keeps it"
+    );
+    assert!(
+        !still_speech(true, 0.25),
+        "until it drops under the hold line"
+    );
 }
 
 #[test]
@@ -2273,28 +2349,63 @@ fn the_pause_bar_fills_from_the_last_word_to_the_cut() {
     splitter.feed(&blocks(&[(17, 0.0)]));
     near(splitter.pause_progress(), 0.5, 0.02, "half way");
     splitter.feed(&blocks(&[(17, 0.0)]));
-    near(splitter.pause_progress(), 0.0, 1e-6, "cut, and the bar starts over");
+    near(
+        splitter.pause_progress(),
+        0.0,
+        1e-6,
+        "cut, and the bar starts over",
+    );
 }
 
 #[test]
 fn the_silence_stop_follows_the_speakers_longest_pause() {
     let mut splitter = splitter(700);
     splitter.feed(&blocks(&[(40, 0.0), (33, 0.1)]));
-    near(splitter.stop_after_seconds(3.5), 2.0, 1e-6, "no pause yet: the floor");
+    near(
+        splitter.stop_after_seconds(3.5),
+        2.0,
+        1e-6,
+        "no pause yet: the floor",
+    );
     // A 0.6 s pause, then more words.
     splitter.feed(&blocks(&[(20, 0.0), (33, 0.1)]));
-    near(splitter.stop_after_seconds(3.5), 2.0, 1e-6, "twice 0.6 s is under the floor");
+    near(
+        splitter.stop_after_seconds(3.5),
+        2.0,
+        1e-6,
+        "twice 0.6 s is under the floor",
+    );
     // A 1.5 s pause, then more words.
     splitter.feed(&blocks(&[(50, 0.0), (33, 0.1)]));
-    near(splitter.stop_after_seconds(3.5), 3.0, 0.05, "twice the longest pause");
+    near(
+        splitter.stop_after_seconds(3.5),
+        3.0,
+        0.05,
+        "twice the longest pause",
+    );
     // A 4 s pause: the setting caps it.
     splitter.feed(&blocks(&[(134, 0.0), (33, 0.1)]));
-    near(splitter.stop_after_seconds(3.5), 3.5, 1e-6, "never over the setting");
-    near(splitter.stop_after_seconds(1.5), 1.5, 1e-6, "a setting under the floor wins");
+    near(
+        splitter.stop_after_seconds(3.5),
+        3.5,
+        1e-6,
+        "never over the setting",
+    );
+    near(
+        splitter.stop_after_seconds(1.5),
+        1.5,
+        1e-6,
+        "a setting under the floor wins",
+    );
 
     let mut fresh = self::splitter(700);
     fresh.feed(&blocks(&[(200, 0.0), (33, 0.1)]));
-    near(fresh.stop_after_seconds(3.5), 2.0, 1e-6, "the run-up before the first word is not a pause");
+    near(
+        fresh.stop_after_seconds(3.5),
+        2.0,
+        1e-6,
+        "the run-up before the first word is not a pause",
+    );
 }
 
 #[test]
@@ -2305,7 +2416,10 @@ fn a_piece_cut_at_a_hesitation_loses_its_dots_and_fillers() {
         ("and then…", "and then"),
         ("So I went there, um", "So I went there"),
         ("It works. Uh...", "It works."),
-        ("What is happening here now is that", "What is happening here now is that"),
+        (
+            "What is happening here now is that",
+            "What is happening here now is that",
+        ),
         ("Done.", "Done."),
         ("Really?", "Really?"),
         ("uh...", ""),
@@ -2323,7 +2437,10 @@ fn a_sentence_goes_out_once_the_pause_after_it_is_long_enough() {
     let speech = blocks(&[(33, 0.1)]);
     assert!(splitter.feed(&speech).is_empty(), "still talking");
     let short = blocks(&[(33, 0.0)]);
-    assert!(splitter.feed(&short).is_empty(), "the pause is not over yet");
+    assert!(
+        splitter.feed(&short).is_empty(),
+        "the pause is not over yet"
+    );
     let out = splitter.feed(&blocks(&[(1, 0.0)]));
     assert_eq!(out.len(), 1, "one more frame and the sentence is out");
     // The speech and a 0.3 s tail, not the whole second of silence.
@@ -2343,7 +2460,10 @@ fn audio_arriving_in_odd_sized_chunks_is_split_the_same() {
     }
     assert_eq!(out_whole.len(), 2);
     assert_eq!(out_pieces.len(), 2, "two sentences either way");
-    assert_eq!(out_whole.pop().unwrap().len(), out_pieces.pop().unwrap().len());
+    assert_eq!(
+        out_whole.pop().unwrap().len(),
+        out_pieces.pop().unwrap().len()
+    );
 }
 
 #[test]
@@ -2369,23 +2489,38 @@ fn what_is_left_at_the_end_is_the_last_sentence() {
     let mut splitter = splitter(1000);
     assert!(splitter.feed(&blocks(&[(33, 0.1), (40, 0.0)])).len() == 1);
     assert!(splitter.feed(&blocks(&[(20, 0.1), (5, 0.0)])).is_empty());
-    let last = splitter.finish().expect("the unfinished sentence comes out");
+    let last = splitter
+        .finish()
+        .expect("the unfinished sentence comes out");
     assert!(last.len() / 480 >= 20, "with all of its speech");
 
     let mut splitter = self::splitter(1000);
     assert!(splitter.feed(&blocks(&[(33, 0.1), (40, 0.0)])).len() == 1);
-    assert!(splitter.finish().is_none(), "nothing was said after the last cut");
+    assert!(
+        splitter.finish().is_none(),
+        "nothing was said after the last cut"
+    );
 }
 
 #[test]
 fn silence_is_counted_from_the_last_word_and_from_the_start() {
     let mut splitter = splitter(1000);
     splitter.feed(&blocks(&[(100, 0.0)]));
-    near(splitter.silence_seconds(), 3.0, 0.05, "quiet from the start");
+    near(
+        splitter.silence_seconds(),
+        3.0,
+        0.05,
+        "quiet from the start",
+    );
     splitter.feed(&blocks(&[(10, 0.1)]));
     near(splitter.silence_seconds(), 0.0, 0.001, "a word resets it");
     splitter.feed(&blocks(&[(200, 0.0)]));
-    near(splitter.silence_seconds(), 6.0, 0.05, "and it grows again after");
+    near(
+        splitter.silence_seconds(),
+        6.0,
+        0.05,
+        "and it grows again after",
+    );
 }
 
 #[test]

@@ -88,7 +88,7 @@ impl<D: SpeechDetector> Segmenter<D> {
         self.partial.extend_from_slice(samples);
         let whole = self.partial.len() / FRAME * FRAME;
         let frames: Vec<f32> = self.partial.drain(..whole).collect();
-        for frame in frames.chunks_exact(FRAME) {
+        for frame in frames.as_chunks::<FRAME>().0 {
             self.peak = self.peak.max(frame.iter().fold(0.0f32, |m, s| m.max(s.abs())));
             let gain = NORMALIZED_PEAK / self.peak.max(PEAK_FLOOR);
             let scaled: Vec<f32> = frame.iter().map(|s| s * gain).collect();

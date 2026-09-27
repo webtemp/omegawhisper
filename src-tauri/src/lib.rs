@@ -15,6 +15,8 @@ mod shortcut;
 mod storage;
 mod tray;
 mod typing;
+#[cfg(desktop)]
+mod update;
 mod vad;
 
 #[cfg(test)]
@@ -230,9 +232,50 @@ fn get_platform() -> PlatformInfo {
     }
 }
 
+// The settings window, brought forward or built. From the tray, and on
+// Windows from a second launch of the app.
+fn open_settings_window(app: &AppHandle) {
+    use tauri::Manager;
+    // regular app so the window is focusable
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    if let Some(w) = app.get_webview_window("settings") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    } else {
+        use tauri::{WebviewUrl, WebviewWindowBuilder};
+        // same window shape as the in-app settings button
+        match WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings".into()))
+            .title("Settings")
+            .inner_size(450.0, 550.0)
+            .decorations(false)
+            .transparent(true)
+            .resizable(false)
+            .center()
+            .build()
+        {
+            Ok(w) => {
+                let _ = w.set_focus();
+                // back to a background menu-bar agent
+                // once settings closes
+                #[cfg(target_os = "macos")]
+                {
+                    let handle = app.clone();
+                    w.on_window_event(move |event| {
+                        if let tauri::WindowEvent::Destroyed = event {
+                            let _ =
+                                handle.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                        }
+                    });
+                }
+            }
+            Err(e) => eprintln!("Failed to create settings window: {}", e),
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(unix)]
     redirect_output_to_log();
 
     #[cfg(target_os = "linux")]
@@ -241,6 +284,8 @@ pub fn run() {
     // Say at startup whether text can be typed into other apps. This is
     // granted per bundle identifier, so it is lost whenever the app is
     // renamed or reinstalled under a new identifier.
+    // Windows has nothing to check here: no permission, no typing tool.
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut startup_warnings: Vec<String> = Vec::new();
 
     #[cfg(target_os = "macos")]
@@ -268,6 +313,9 @@ pub fn run() {
             eprintln!("Typing into other apps: {}", names.join(", then "));
         }
     }
+
+    #[cfg(windows)]
+    eprintln!("Typing into other apps: SendInput, the clipboard when it refuses.");
 
     // Ask for the microphone now, not at the first F3.
     //
@@ -343,10 +391,20 @@ pub fn run() {
         portal: linux::Portal::default(),
     };
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Windows runs as many copies as are started, and only the first holds
+    // the dictation key. A second start opens Settings in the first and
+    // ends. Must be the first plugin, so nothing else runs before the check.
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        eprintln!("Started again while already running: opening Settings instead.");
+        open_settings_window(app);
+    }));
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Starting the app when the computer starts. LaunchAgent writes a file
         // in ~/Library/LaunchAgents; the other choice, AppleScript, makes macOS
         // ask the user to let Omegawhisper control System Events first.
@@ -412,6 +470,10 @@ pub fn run() {
             // Keep the login entry pointing at this copy of the app.
             #[cfg(desktop)]
             settings::refresh_start_at_login(app.handle());
+
+            // Only Windows has a build on GitHub Releases to update to.
+            #[cfg(windows)]
+            update::check_on_startup(app.handle().clone());
 
             // The saved key toggles recording from anywhere. Under Wayland
             // the key grab cannot see it, so the desktop's portal holds the
@@ -487,49 +549,7 @@ pub fn run() {
                     .menu(&menu)
                     .tooltip("Omegawhisper — press F3 to dictate")
                     .on_menu_event(move |app, event| match event.id.as_ref() {
-                        "open_settings_window" => {
-                            // regular app so the window is focusable
-                            #[cfg(target_os = "macos")]
-                            let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
-                            if let Some(w) = app.get_webview_window("settings") {
-                                let _ = w.show();
-                                let _ = w.set_focus();
-                            } else {
-                                use tauri::{WebviewUrl, WebviewWindowBuilder};
-                                // same window shape as the in-app settings button
-                                match WebviewWindowBuilder::new(
-                                    app,
-                                    "settings",
-                                    WebviewUrl::App("settings".into()),
-                                )
-                                .title("Settings")
-                                .inner_size(450.0, 550.0)
-                                .decorations(false)
-                                .transparent(true)
-                                .resizable(false)
-                                .center()
-                                .build()
-                                {
-                                    Ok(w) => {
-                                        let _ = w.set_focus();
-                                        // back to a background menu-bar agent
-                                        // once settings closes
-                                        #[cfg(target_os = "macos")]
-                                        {
-                                            let handle = app.clone();
-                                            w.on_window_event(move |event| {
-                                                if let tauri::WindowEvent::Destroyed = event {
-                                                    let _ = handle.set_activation_policy(
-                                                        tauri::ActivationPolicy::Accessory,
-                                                    );
-                                                }
-                                            });
-                                        }
-                                    }
-                                    Err(e) => eprintln!("Failed to create settings window: {}", e),
-                                }
-                            }
-                        }
+                        "open_settings_window" => open_settings_window(app),
                         "open_recordings" => {
                             // Every dictation leaves two WAV files here and
                             // nothing removes them, so make the folder reachable.
@@ -586,7 +606,9 @@ pub fn run() {
                         }
                         "quit" => app.exit(0),
                         id => {
-                            history::handle_history_click(app, id);
+                            if !settings::handle_language_click(app, id) {
+                                history::handle_history_click(app, id);
+                            }
                         }
                     });
 

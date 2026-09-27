@@ -66,7 +66,7 @@ impl AudioResampler {
         let padding_needed = self.chunk_size - remaining;
         self.input_buffer.extend(vec![0.0f32; padding_needed]);
 
-        let chunk: Vec<f32> = self.input_buffer.drain(..).collect();
+        let chunk = std::mem::take(&mut self.input_buffer);
         let input_frames = vec![chunk];
 
         let resampled = self

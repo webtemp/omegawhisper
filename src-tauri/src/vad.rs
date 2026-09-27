@@ -66,7 +66,7 @@ pub(crate) fn speech_seconds(samples: &[f32]) -> Result<f32, String> {
     let mut vad = SileroVad::new(model_path()?, THRESHOLD)
         .map_err(|e| format!("The speech detector could not be loaded: {}", e))?;
     let mut frames = 0usize;
-    for frame in normalized(samples).chunks_exact(FRAME) {
+    for frame in normalized(samples).as_chunks::<FRAME>().0 {
         if vad.is_speech(frame).map_err(|e| e.to_string())? {
             frames += 1;
         }
