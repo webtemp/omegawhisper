@@ -14,6 +14,20 @@ use tauri::{AppHandle, Manager, Wry};
 pub(crate) fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let transcripts_item = crate::history::build_history_menu(app)?;
 
+    // The language, one tick. Whisper follows it from the next dictation.
+    let chosen = app.state::<AudioState>().prefs().language;
+    let language_item = Submenu::with_id(app, "language", "Language", true)?;
+    for (code, name) in crate::settings::LANGUAGES {
+        language_item.append(&CheckMenuItem::with_id(
+            app,
+            format!("{}{}", crate::settings::LANGUAGE_MENU_ID, code),
+            name,
+            true,
+            chosen == code,
+            None::<&str>,
+        )?)?;
+    }
+
     let settings_item = MenuItem::with_id(
         app,
         "open_settings_window",
@@ -56,6 +70,7 @@ pub(crate) fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         app,
         &[
             &transcripts_item,
+            &language_item,
             &recordings_item,
             &debug_item,
             &settings_item,

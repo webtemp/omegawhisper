@@ -335,13 +335,47 @@ pub(crate) async fn set_visualisation(app: AppHandle, name: String) -> Result<()
     Ok(())
 }
 
-#[tauri::command]
-pub(crate) async fn set_language(state: State<'_, AudioState>, code: String) -> Result<(), String> {
+// Tray menu ids for the languages: the prefix and the code.
+pub(crate) const LANGUAGE_MENU_ID: &str = "language:";
+
+pub(crate) fn language_from_menu_id(id: &str) -> Option<&'static str> {
+    let code = id.strip_prefix(LANGUAGE_MENU_ID)?;
+    LANGUAGES.iter().map(|(c, _)| *c).find(|c| *c == code)
+}
+
+// From the tray or the settings page: saved, the page told, and the tray
+// menu built again so the tick moves. The rebuild wants the main thread.
+pub(crate) fn set_language_everywhere(app: &AppHandle, code: &str) -> Result<(), String> {
     if !LANGUAGES.iter().any(|(c, _)| *c == code) {
         return Err(format!("\"{}\" is not a language this app offers.", code));
     }
-    state.update_prefs(|p| p.language = code);
+    app.state::<AudioState>()
+        .update_prefs(|p| p.language = code.to_string());
+    eprintln!("Language: {}", code);
+    let _ = app.emit("language-changed", code);
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Err(e) = crate::tray::rebuild_menu(&handle) {
+            eprintln!("Could not rebuild the tray menu: {}", e);
+        }
+    });
     Ok(())
+}
+
+// A click on one of the tray's language items. False for any other id.
+pub(crate) fn handle_language_click(app: &AppHandle, id: &str) -> bool {
+    match language_from_menu_id(id) {
+        Some(code) => {
+            let _ = set_language_everywhere(app, code);
+            true
+        }
+        None => false,
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn set_language(app: AppHandle, code: String) -> Result<(), String> {
+    set_language_everywhere(&app, &code)
 }
 
 // Takes effect at the next recording: the running capture reads it once.

@@ -606,7 +606,9 @@ pub fn run() {
                         }
                         "quit" => app.exit(0),
                         id => {
-                            history::handle_history_click(app, id);
+                            if !settings::handle_language_click(app, id) {
+                                history::handle_history_click(app, id);
+                            }
                         }
                     });
 

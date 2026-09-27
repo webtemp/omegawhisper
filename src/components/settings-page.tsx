@@ -296,6 +296,14 @@ export function SettingsPage() {
     };
   }, []);
 
+  // The tray menu changes it too.
+  useEffect(() => {
+    const unlisten = listen<string>("language-changed", (event) => setLanguage(event.payload));
+    return () => {
+      unlisten.then((fn) => fn()).catch(() => {});
+    };
+  }, []);
+
   const openShortcutSettings = () => {
     setShortcutError(null);
     invoke("open_shortcut_settings").catch((err) => setShortcutError(String(err)));

@@ -2050,6 +2050,23 @@ fn a_dead_microphone_and_a_silent_room_are_told_apart() {
     }
 }
 
+mod language_menu {
+    use crate::settings::{language_from_menu_id, LANGUAGES, LANGUAGE_MENU_ID};
+
+    #[test]
+    fn every_language_has_a_menu_id_that_reads_back_and_nothing_else_does() {
+        for (code, _) in LANGUAGES {
+            assert_eq!(
+                language_from_menu_id(&format!("{}{}", LANGUAGE_MENU_ID, code)),
+                Some(code)
+            );
+        }
+        assert_eq!(language_from_menu_id("language:klingon"), None);
+        assert_eq!(language_from_menu_id("transcript:0"), None);
+        assert_eq!(language_from_menu_id("quit"), None);
+    }
+}
+
 mod unicode_typing {
     use crate::typing::{utf16_chunks, CHUNK_UTF16_UNITS};
 
