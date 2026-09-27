@@ -17,6 +17,10 @@ env:
   # Windows caps object-file paths at 250 characters and the shader
   # generator's build directory sits 240 deep under target/; build short.
   CARGO_TARGET_DIR: D:\a\t
+  # whisper.cpp tunes for the CPU that builds it, and the runner has AVX-512
+  # that most PCs lack: an illegal-instruction crash at startup. Off means
+  # the AVX2 baseline, which every CPU Windows 11 runs on has.
+  GGML_NATIVE: "OFF"
 
 jobs:
   check:
