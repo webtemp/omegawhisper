@@ -52,8 +52,10 @@ jobs:
           install_runtime: true
           cache: true
       - run: bun install --frozen-lockfile
-      # Builds the NSIS installer, signs it for the updater, uploads both and
-      # latest.json to the release for this tag.
+      # Builds the NSIS installer and uploads it to the release for this tag.
+      # With the TAURI_SIGNING_PRIVATE_KEY secret set it also signs the
+      # installer for the updater and uploads latest.json; without it the
+      # release is a plain installer that running copies will not offer.
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -66,4 +68,5 @@ jobs:
           releaseDraft: false
           # A tag like v0.6.0-rc.1 is a prerelease: the updater ignores those.
           prerelease: ${{ contains(github.ref_name, '-') }}
-          uploadUpdaterJson: true
+          uploadUpdaterJson: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          args: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && '--config src-tauri/tauri.updater.conf.json' || '' }}

@@ -455,8 +455,9 @@ which running copies of the app read at startup.
 
 The updater key pair was made with `bun run tauri signer generate`. The public half is in
 `tauri.conf.json`; the private half is not in the repository and must never be. It lives
-in `~/.tauri/omegawhisper.key` and in the repository secret `TAURI_SIGNING_PRIVATE_KEY`.
-Lose it and no installed copy can ever be updated again.
+in `~/.tauri/omegawhisper.key`. Put it in the repository secret `TAURI_SIGNING_PRIVATE_KEY`
+when the app should update itself: releases built without the secret are plain installers
+that running copies never offer. Lose the key and no installed copy can ever be updated.
 
 To cut a release:
 

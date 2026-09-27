@@ -63,7 +63,7 @@ F3 anywhere (macOS and X11: global key grab; Wayland: GlobalShortcuts portal;
 - `managers/transcription.rs` — loads a model, runs `transcribe-rs`
 - `resampler.rs` — resample the microphone's rate down to 16 kHz
 
-`src-tauri/tauri.windows.conf.json` — merged into `tauri.conf.json` on Windows builds only: `targets: nsis` and `createUpdaterArtifacts`, kept out of the main file so a Linux or macOS build needs no signing key. `.github/workflows/windows.yml` — check, clippy and tests on every push; a `v*` tag builds, signs and publishes the installer with `latest.json`.
+`src-tauri/tauri.windows.conf.json` — merged into `tauri.conf.json` on Windows builds only: `targets: nsis`. `tauri.updater.conf.json` — `createUpdaterArtifacts`, passed with `--config` by CI only when the signing secret exists, so no build ever needs the key to succeed. `.github/workflows/windows.yml` — check, clippy and tests on every push; a `v*` tag builds, signs and publishes the installer with `latest.json`.
 
 `src-tauri/icons/` — all committed, none generated. `icon.icns`/`icon.ico` and the sized PNGs are the app icon; `tray/` holds the menu-bar frames (`key-up`/`mid`/`down`, plus an unused `switch-*` set) as SVG source beside the 36x36 PNG that is compiled in. `TRAY_ICON` in `tray.rs` picks the set; `watch_tray_icon` plays the frames off the recording flag.
 
