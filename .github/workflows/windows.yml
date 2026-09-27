@@ -14,6 +14,9 @@ env:
   # finds the compiler through the environment, which the Visual Studio
   # generator does not provide. Ninja inside the MSVC developer shell does.
   CMAKE_GENERATOR: Ninja
+  # Windows caps object-file paths at 250 characters and the shader
+  # generator's build directory sits 240 deep under target/; build short.
+  CARGO_TARGET_DIR: D:\a\t
 
 jobs:
   check:
@@ -25,7 +28,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          # The cache ignores CARGO_TARGET_DIR; this resolves to D:\a\t.
+          workspaces: src-tauri -> ../../../t
       - uses: oven-sh/setup-bun@v2
       - uses: jakoch/install-vulkan-sdk-action@v1
         with:
@@ -50,7 +54,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          # The cache ignores CARGO_TARGET_DIR; this resolves to D:\a\t.
+          workspaces: src-tauri -> ../../../t
       - uses: oven-sh/setup-bun@v2
       - uses: jakoch/install-vulkan-sdk-action@v1
         with:
