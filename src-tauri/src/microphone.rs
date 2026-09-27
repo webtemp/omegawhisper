@@ -46,6 +46,7 @@ fn linux_sources() -> Result<Vec<AudioDevice>, String> {
 
 // pactl's JSON. Monitors of outputs are left out: nobody dictates through
 // their own speakers.
+#[cfg(target_os = "linux")]
 pub(crate) fn parse_sources(json: &[u8], default: &str) -> Result<Vec<AudioDevice>, String> {
     let sources: Vec<serde_json::Value> = serde_json::from_slice(json)
         .map_err(|e| format!("Could not read the microphone list: {}", e))?;

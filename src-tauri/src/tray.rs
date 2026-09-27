@@ -176,7 +176,7 @@ pub(crate) fn tray_image(frame: usize) -> Option<tauri::image::Image<'static>> {
     let image = tauri::image::Image::from_bytes(bytes).ok()?;
     if let Some(grey) = tray_colour() {
         let mut rgba = image.rgba().to_vec();
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel[0] = grey;
             pixel[1] = grey;
             pixel[2] = grey;

@@ -242,6 +242,8 @@ pub fn run() {
     // Say at startup whether text can be typed into other apps. This is
     // granted per bundle identifier, so it is lost whenever the app is
     // renamed or reinstalled under a new identifier.
+    // Windows has nothing to check here: no permission, no typing tool.
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut startup_warnings: Vec<String> = Vec::new();
 
     #[cfg(target_os = "macos")]
