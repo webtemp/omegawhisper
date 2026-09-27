@@ -1,0 +1,69 @@
+name: Windows
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # bindgen, for whisper.cpp's headers. LLVM ships on the runner image.
+  LIBCLANG_PATH: C:\Program Files\LLVM\bin
+
+jobs:
+  check:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - uses: oven-sh/setup-bun@v2
+      - uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.4.357.0
+          install_runtime: true
+          cache: true
+      - run: bun install --frozen-lockfile
+      # generate_context! embeds the frontend, so it has to exist first.
+      - run: bun run build
+      - run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - uses: oven-sh/setup-bun@v2
+      - uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.4.357.0
+          install_runtime: true
+          cache: true
+      - run: bun install --frozen-lockfile
+      # Builds the NSIS installer, signs it for the updater, uploads both and
+      # latest.json to the release for this tag.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # Add TAURI_SIGNING_PRIVATE_KEY_PASSWORD here if the key gets one.
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Omegawhisper ${{ github.ref_name }}
+          releaseBody: Windows installer below. See README, Install (Windows).
+          releaseDraft: false
+          # A tag like v0.6.0-rc.1 is a prerelease: the updater ignores those.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          uploadUpdaterJson: true

@@ -48,6 +48,7 @@ fn main() {
 }
 
 /// Toggle recording via D-Bus
+#[cfg(unix)]
 fn toggle_recording() -> Result<(), Box<dyn std::error::Error>> {
     // Use blocking D-Bus call since we're in a simple CLI context
     let connection = zbus::blocking::Connection::session()?;
@@ -62,4 +63,10 @@ fn toggle_recording() -> Result<(), Box<dyn std::error::Error>> {
     let _result: bool = proxy.call("ToggleRecording", &())?;
 
     Ok(())
+}
+
+// No D-Bus here: the dictation key is the app's own on Windows.
+#[cfg(not(unix))]
+fn toggle_recording() -> Result<(), Box<dyn std::error::Error>> {
+    Err("transcribe toggle is only for Linux; press the dictation key instead".into())
 }

@@ -15,6 +15,8 @@ mod shortcut;
 mod storage;
 mod tray;
 mod typing;
+#[cfg(desktop)]
+mod update;
 mod vad;
 
 #[cfg(test)]
@@ -232,7 +234,6 @@ fn get_platform() -> PlatformInfo {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(unix)]
     redirect_output_to_log();
 
     #[cfg(target_os = "linux")]
@@ -268,6 +269,9 @@ pub fn run() {
             eprintln!("Typing into other apps: {}", names.join(", then "));
         }
     }
+
+    #[cfg(windows)]
+    eprintln!("Typing into other apps: SendInput, the clipboard when it refuses.");
 
     // Ask for the microphone now, not at the first F3.
     //
@@ -347,6 +351,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Starting the app when the computer starts. LaunchAgent writes a file
         // in ~/Library/LaunchAgents; the other choice, AppleScript, makes macOS
         // ask the user to let Omegawhisper control System Events first.
@@ -412,6 +417,10 @@ pub fn run() {
             // Keep the login entry pointing at this copy of the app.
             #[cfg(desktop)]
             settings::refresh_start_at_login(app.handle());
+
+            // Only Windows has a build on GitHub Releases to update to.
+            #[cfg(windows)]
+            update::check_on_startup(app.handle().clone());
 
             // The saved key toggles recording from anywhere. Under Wayland
             // the key grab cannot see it, so the desktop's portal holds the

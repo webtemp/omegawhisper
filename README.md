@@ -24,9 +24,9 @@ account and no server.
 ### Features
 
 - One global shortcut, works in any app. **F3** by default
-- macOS (Apple Silicon) and Linux (Wayland or X11)
-- Types into other apps: Unicode key events on macOS, `ydotool`/`wtype`/`xdotool` on Linux
-- Local models on the GPU: Metal and CoreML on the Mac, Vulkan on Linux
+- macOS (Apple Silicon), Linux (Wayland or X11) and Windows 11
+- Types into other apps: Unicode key events on macOS and Windows, `ydotool`/`wtype`/`xdotool` on Linux
+- Local models on the GPU: Metal and CoreML on the Mac, Vulkan on Linux and Windows
 - Spectrogram indicator window while you speak
 - Recordings saved as WAV, and deletable from the tray menu
 - Silence is never sent to the model, so it cannot invent text from a quiet room. Speech is recognised by Silero VAD, so a quiet microphone works as well as a loud one
@@ -259,6 +259,48 @@ Models are 80 MB to 1.6 GB, so the first download takes a moment.
 
 The microphone defaults to the system input; Settings → Microphone picks another.
 
+## Install (Windows)
+
+Windows 11, 64-bit. This is the one system with prebuilt releases: every
+[GitHub release](https://github.com/webtemp/omegawhisper/releases) carries
+`Omegawhisper_<version>_x64-setup.exe`.
+
+1. Download the installer and run it. It installs for your user only, under
+   `%LOCALAPPDATA%\Omegawhisper`, asks for no administrator password, adds a Start menu
+   entry, and can be removed from Settings → Apps.
+2. **SmartScreen.** The installer is not code-signed yet, so Windows says *Windows protected
+   your PC*. Click **More info**, then **Run anyway**. The browser may also ask to keep the
+   download.
+3. WebView2 is part of Windows 11. If it is missing, the installer downloads it.
+4. Start Omegawhisper from the Start menu. It sits in the system tray, under the `^` next
+   to the clock. Open **Settings** from its icon, download **Whisper Turbo**, press **F3**.
+
+Typing is done with Unicode key events (`SendInput`), so any language works whatever the
+keyboard layout. Anything that refuses them is pasted with Ctrl+V instead. A program running
+as administrator accepts no keys from one that is not: for those, paste by hand - the text is
+on the clipboard whenever typing fails.
+
+Whisper runs on the graphics card through Vulkan, with any current AMD, NVIDIA or Intel
+driver. Parakeet and Moonshine run on the processor; the second switch changes nothing on
+Windows.
+
+Start at login writes the `Run` key under `HKEY_CURRENT_USER` in the registry.
+
+At startup the app asks GitHub Releases whether there is a newer version and, if there is,
+asks before installing it. That request is the only thing the app ever sends anywhere.
+
+### For testers
+
+- **The installer** is the `-setup.exe` on the
+  [releases page](https://github.com/webtemp/omegawhisper/releases).
+- **SmartScreen:** *More info* → *Run anyway*.
+- **The log** is `%LOCALAPPDATA%\omegawhisper\omegawhisper.log`. Paste that into the
+  Explorer address bar. It starts over when it reaches 5 MB, so copy it soon after a failure.
+- **Recordings** are next to it, in `%LOCALAPPDATA%\omegawhisper\recordings`.
+- **When something fails,** send the log, what you pressed and said, the app you were typing
+  into, your Windows version (`winver`) and graphics card. Switch on **Show debug stats** in
+  the tray menu first: it puts a line of numbers for every dictation into the log.
+
 ## Using it
 
 Press **F3** to start, speak, press **F3** to stop. That is the whole app.
@@ -314,7 +356,7 @@ The menu-bar or tray icon has:
 
 | Item | What it does |
 |---|---|
-| Recordings → Open Folder | `~/Library/Application Support/omegawhisper/recordings` on the Mac, `~/.local/share/omegawhisper/recordings` on Linux |
+| Recordings → Open Folder | `~/Library/Application Support/omegawhisper/recordings` on the Mac, `~/.local/share/omegawhisper/recordings` on Linux, `%LOCALAPPDATA%\omegawhisper\recordings` on Windows |
 | Recordings → Delete Recordings | Deletes every saved WAV. Asks first |
 | Show debug stats | Live microphone numbers, and a line of numbers under each result. Also in Settings |
 | Settings | Dictation key, microphone, models, graphics card, startup |
@@ -324,13 +366,16 @@ The menu-bar or tray icon has:
 
 **Nothing happens when I press the key.** On the Mac, another app has taken it or
 Accessibility is off. On Linux under Wayland, the desktop was told no in the dialog, or the
-key is taken: System Settings → Keyboard → Shortcuts → Omegawhisper shows what it holds.
+key is taken: System Settings → Keyboard → Shortcuts → Omegawhisper shows what it holds. On
+Windows, another program holds the key; pick a different one in Settings.
 Startup problems appear on the indicator as a message when the app starts.
 
 **Text is transcribed but never typed.** On the Mac: Accessibility. If you rebuilt the app,
 the grant is gone even though the checkbox still looks on: reset it (step 5). On Linux:
 `ydotool` is missing or its service is not running. The text is put on the clipboard
-instead, and the log says which tool failed and why.
+instead, and the log says which tool failed and why. On Windows: the program you were typing
+into runs as administrator, which blocks keys from ordinary programs; the text is on the
+clipboard.
 
 **The build says `failed to run 'cargo metadata'` / `No such file or directory (os error 2)`.**
 That means the build cannot find `cargo`. Two different causes:
@@ -362,8 +407,9 @@ they reach the model, so this should not happen. If it does, the log line for th
 dictation shows the loudness it measured.
 
 **Anything else.** The log is at
-`~/Library/Application Support/omegawhisper/omegawhisper.log` on the Mac and
-`~/.local/share/omegawhisper/omegawhisper.log` on Linux. Switch on **Show debug
+`~/Library/Application Support/omegawhisper/omegawhisper.log` on the Mac,
+`~/.local/share/omegawhisper/omegawhisper.log` on Linux and
+`%LOCALAPPDATA%\omegawhisper\omegawhisper.log` on Windows. Switch on **Show debug
 stats**, in the menu bar or in Settings, to get live microphone numbers and a line of
 numbers per dictation.
 
@@ -389,6 +435,7 @@ src-tauri/src/
   settings.rs              the settings file; microphone.rs  input devices
   indicator.rs  chime.rs  tray.rs  shortcut.rs  typing.rs  storage.rs
   linux.rs                 desktop file, portal dictation key, layer-shell indicator
+  update.rs                the startup check for a newer release, Windows for now
   managers/model.rs        model list, download, delete
   managers/transcription.rs  loads a model, runs transcribe-rs
 src-tauri/icons/           app icon and menu-bar frames, all committed
@@ -398,6 +445,31 @@ src-tauri/icons/           app icon and menu-bar frames, all committed
 
 `flake.nix` and `shell.nix` predate the Linux work and have not been run since; the
 packages listed under Install (Linux) are the tested path.
+
+### Windows builds and releases
+
+There is no Windows machine here; `.github/workflows/windows.yml` does the building. Every
+push runs `cargo check`, clippy and the tests on a Windows runner. A tag `v*` builds the
+NSIS installer, signs it for the updater and publishes a GitHub release with `latest.json`,
+which running copies of the app read at startup.
+
+The updater key pair was made with `bun run tauri signer generate`. The public half is in
+`tauri.conf.json`; the private half is not in the repository and must never be. It lives
+in `~/.tauri/omegawhisper.key` and in the repository secret `TAURI_SIGNING_PRIVATE_KEY`.
+Lose it and no installed copy can ever be updated again.
+
+To cut a release:
+
+```sh
+# 1. same version in package.json, src-tauri/Cargo.toml, src-tauri/tauri.conf.json
+# 2. commit, then
+git tag v0.6.0
+git push origin main v0.6.0
+```
+
+The workflow publishes the release a while later; the first build compiles whisper.cpp and
+takes the longest. The tag must be `v` followed by the version in `tauri.conf.json`, or
+the updater will announce one version and install another.
 
 ## License
 

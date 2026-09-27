@@ -62,7 +62,6 @@ pub(crate) fn delete_recordings_in(dir: &std::path::Path) -> Result<usize, Strin
 // Everything the app prints goes to one file, whatever started it - Finder,
 // the tray, or a terminal. Launched from Finder there is no terminal to print
 // to, so a dictation that went wrong used to leave no trace at all.
-#[cfg(unix)]
 pub(crate) fn redirect_output_to_log() {
     let Some(dir) = dirs::data_local_dir() else {
         return;
@@ -83,13 +82,38 @@ pub(crate) fn redirect_output_to_log() {
     let Ok(file) = fs::OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
-    use std::os::unix::io::AsRawFd;
-    unsafe {
-        libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO);
-        libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO);
+            libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+        }
     }
-    // The file must outlive this function: the two descriptors above now
-    // point at it and closing it here would close them too.
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::{
+            SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        let handle = file.as_raw_handle();
+        // Rust's print macros ask for the standard handles on every write, so
+        // this is enough for them: a release build has no console and dropped
+        // everything until now. The C runtime keeps its own stdout and
+        // stderr, which whisper.cpp prints through, so those are pointed at
+        // the file as well.
+        unsafe {
+            SetStdHandle(STD_OUTPUT_HANDLE, handle);
+            SetStdHandle(STD_ERROR_HANDLE, handle);
+            let fd = libc::open_osfhandle(handle as isize, 0);
+            if fd >= 0 {
+                libc::dup2(fd, 1);
+                libc::dup2(fd, 2);
+            }
+        }
+    }
+    // The file must outlive this function: the descriptors above now point
+    // at it and closing it here would close them too.
     std::mem::forget(file);
 
     eprintln!(

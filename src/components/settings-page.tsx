@@ -175,7 +175,7 @@ export function SettingsPage() {
     whisper_gpu: "Metal",
     onnx_gpu: "CoreML",
   });
-  const where = platform.os === "linux" ? "system tray" : "menu bar";
+  const where = platform.os === "macos" ? "menu bar" : "system tray";
   const [showAllModels, setShowAllModels] = useState(false);
 
   // Disable right-click context menu

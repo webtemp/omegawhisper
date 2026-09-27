@@ -6,8 +6,28 @@ use tauri::AppHandle;
 
 // How many UTF-16 units to put in one key event. A Unicode key event carries
 // only a short string, so long text is sent in several events.
-#[cfg(target_os = "macos")]
 pub(crate) const CHUNK_UTF16_UNITS: usize = 20;
+
+// The text as UTF-16, in pieces of at most CHUNK_UTF16_UNITS. Split on
+// character boundaries, never inside a surrogate pair, or the character is
+// corrupted.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn utf16_chunks(text: &str) -> Vec<Vec<u16>> {
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < utf16.len() {
+        let mut end = std::cmp::min(start + CHUNK_UTF16_UNITS, utf16.len());
+        // A leading surrogate at the end means the pair is split - keep it
+        // with its trailing half in the next chunk.
+        if end < utf16.len() && (0xD800..0xDC00).contains(&utf16[end - 1]) {
+            end -= 1;
+        }
+        chunks.push(utf16[start..end].to_vec());
+        start = end;
+    }
+    chunks
+}
 
 // Whether this app is allowed to control the computer (Accessibility).
 // Without it the key events are created but the system drops them, so the
@@ -35,7 +55,6 @@ pub(crate) fn type_text_now(app: &AppHandle, text: &str) -> Result<(), String> {
 // Enter in the focused app, for sending what was just typed.
 #[allow(clippy::needless_return)]
 pub(crate) fn press_enter(app: &AppHandle) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
     let _ = app;
     // Let the target take in the last text first.
     thread::sleep(Duration::from_millis(80));
@@ -56,9 +75,14 @@ pub(crate) fn press_enter(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
-        let _ = app;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        return windows::send(&windows::tap(VK_RETURN));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
         let mut failures = Vec::new();
         for tool in typing_tools() {
             let result = match tool.name {
@@ -71,18 +95,21 @@ pub(crate) fn press_enter(app: &AppHandle) -> Result<(), String> {
                 Err(e) => failures.push(format!("{} {}", tool.name, e)),
             }
         }
-        Err(format!("Nothing could press Enter: {}", failures.join("; ")))
+        Err(format!(
+            "Nothing could press Enter: {}",
+            failures.join("; ")
+        ))
     }
 }
 
-// The return separates the macOS path from the Linux one below it.
+// The returns separate the macOS and Windows paths from the Linux one below.
 #[allow(clippy::needless_return)]
 fn type_text(app: &AppHandle, text: &str, settle: Duration) -> Result<(), String> {
     if text.is_empty() {
         return Ok(());
     }
     thread::sleep(settle);
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     let _ = app;
 
     #[cfg(target_os = "macos")]
@@ -109,18 +136,9 @@ fn type_text(app: &AppHandle, text: &str, settle: Duration) -> Result<(), String
             .map_err(|_| "Failed to create a keyboard event source".to_string())?;
 
         // One event carries only a short Unicode string, so send the text in
-        // small pieces. Split on character boundaries, never inside a
-        // surrogate pair, or the character is corrupted.
-        let utf16: Vec<u16> = text.encode_utf16().collect();
-        let mut start = 0;
-        while start < utf16.len() {
-            let mut end = std::cmp::min(start + CHUNK_UTF16_UNITS, utf16.len());
-            // A leading surrogate at the end means the pair is split - keep it
-            // with its trailing half in the next chunk.
-            if end < utf16.len() && (0xD800..0xDC00).contains(&utf16[end - 1]) {
-                end -= 1;
-            }
-            let chunk = String::from_utf16_lossy(&utf16[start..end]);
+        // small pieces.
+        for chunk in utf16_chunks(text) {
+            let chunk = String::from_utf16_lossy(&chunk);
 
             for key_down in [true, false] {
                 let event = CGEvent::new_keyboard_event(source.clone(), 0, key_down)
@@ -136,13 +154,25 @@ fn type_text(app: &AppHandle, text: &str, settle: Duration) -> Result<(), String
 
             // Electron apps (Teams, VS Code) drop characters without a pause.
             thread::sleep(Duration::from_millis(2));
-            start = end;
         }
 
         return Ok(());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        // Unicode key events, like the Mac: any character, whatever the
+        // keyboard layout. What SendInput refuses is pasted instead.
+        return match windows::type_unicode(text) {
+            Ok(()) => Ok(()),
+            Err(untyped) => {
+                eprintln!("{} Pasting the rest through the clipboard.", untyped.error);
+                windows::paste(&untyped.rest).map_err(|e| format!("{} {}", untyped.error, e))
+            }
+        };
+    }
+
+    #[cfg(target_os = "linux")]
     {
         let tools = typing_tools();
         if tools.is_empty() {
@@ -171,14 +201,129 @@ fn type_text(app: &AppHandle, text: &str, settle: Duration) -> Result<(), String
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+mod windows {
+    use super::{utf16_chunks, with_clipboard};
+    use std::thread;
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+        VK_CONTROL, VK_RETURN, VK_V,
+    };
+
+    // What SendInput would not take, and the text from that point on.
+    pub(super) struct Untyped {
+        pub(super) error: String,
+        pub(super) rest: String,
+    }
+
+    fn key(vk: u16, scan: u16, flags: u32) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: scan,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    // A key pressed and released.
+    pub(super) fn tap(vk: u16) -> [INPUT; 2] {
+        [key(vk, 0, 0), key(vk, 0, KEYEVENTF_KEYUP)]
+    }
+
+    // Down and up for every unit. A newline goes as the Return key: as a
+    // Unicode character most apps make nothing of it. Carriage returns are
+    // dropped so "\r\n" is one line break.
+    fn unicode_inputs(chunk: &[u16]) -> Vec<INPUT> {
+        chunk
+            .iter()
+            .filter(|&&unit| unit != 0x0D)
+            .flat_map(|&unit| match unit {
+                0x0A => tap(VK_RETURN),
+                _ => [
+                    key(0, unit, KEYEVENTF_UNICODE),
+                    key(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+                ],
+            })
+            .collect()
+    }
+
+    pub(super) fn send(inputs: &[INPUT]) -> Result<(), String> {
+        let sent = unsafe {
+            SendInput(
+                inputs.len() as u32,
+                inputs.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            )
+        };
+        if sent as usize == inputs.len() {
+            return Ok(());
+        }
+        let code = unsafe { GetLastError() };
+        Err(format!(
+            "SendInput took {} of {} key events (error {}).",
+            sent,
+            inputs.len(),
+            code
+        ))
+    }
+
+    pub(super) fn type_unicode(text: &str) -> Result<(), Untyped> {
+        let chunks = utf16_chunks(text);
+        for (index, chunk) in chunks.iter().enumerate() {
+            if let Err(error) = send(&unicode_inputs(chunk)) {
+                let rest: Vec<u16> = chunks[index..].concat();
+                return Err(Untyped {
+                    error,
+                    rest: String::from_utf16_lossy(&rest),
+                });
+            }
+            // Electron apps (Teams, VS Code) drop characters without a pause.
+            thread::sleep(Duration::from_millis(2));
+        }
+        Ok(())
+    }
+
+    // Clipboard, Ctrl+V, then the clipboard put back.
+    pub(super) fn paste(text: &str) -> Result<(), String> {
+        with_clipboard(|clipboard| {
+            let before = clipboard.get_text().ok();
+            clipboard
+                .set_text(text)
+                .map_err(|e| format!("could not use the clipboard: {}", e))?;
+            thread::sleep(Duration::from_millis(50));
+            let chord = [
+                key(VK_CONTROL, 0, 0),
+                key(VK_V, 0, 0),
+                key(VK_V, 0, KEYEVENTF_KEYUP),
+                key(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+            ];
+            let pressed = send(&chord);
+            // The target reads the clipboard on the key press; give it that long.
+            thread::sleep(Duration::from_millis(200));
+            if let Some(previous) = before {
+                let _ = clipboard.set_text(previous);
+            }
+            pressed
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) struct TypingTool {
     pub(crate) name: &'static str,
     args: &'static [&'static str],
     hint: &'static str,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub(crate) const NO_TOOL_MESSAGE: &str = "Text cannot be typed into other apps: none of \
     wtype, ydotool or xdotool is installed. ydotool works on any desktop once its \
     service is running.";
@@ -186,7 +331,7 @@ pub(crate) const NO_TOOL_MESSAGE: &str = "Text cannot be typed into other apps: 
 // wtype types any character but needs a protocol KWin does not offer. ydotool
 // works anywhere, 2 ms per key so a long text is not one burst a program
 // can lose, but from a US keymap. xdotool is for X11.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 const TOOLS: [TypingTool; 3] = [
     TypingTool {
         name: "wtype",
@@ -207,7 +352,7 @@ const TOOLS: [TypingTool; 3] = [
 
 // Best first for the session: xdotool cannot type into Wayland windows, wtype
 // cannot type into X11 ones.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn tool_order(wayland: bool) -> [&'static str; 3] {
     if wayland {
         ["wtype", "ydotool", "xdotool"]
@@ -218,17 +363,17 @@ pub(crate) fn tool_order(wayland: bool) -> [&'static str; 3] {
 
 // Linux key codes for Ctrl+V: 29 is left Ctrl, 47 is V. ydotool wants one
 // argument per key; joined into one it presses nothing and reports success.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub(crate) const PASTE_CHORD: [&str; 4] = ["29:1", "47:1", "47:0", "29:0"];
 
 // ydotool types one key every 2 ms from a keymap with no Cyrillic or accents,
 // so everything it is given goes through the clipboard and lands at once.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn needs_paste(tool: &str, _text: &str) -> bool {
     tool == "ydotool"
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn typing_tools() -> Vec<&'static TypingTool> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
     tool_order(wayland)
@@ -238,7 +383,7 @@ pub(crate) fn typing_tools() -> Vec<&'static TypingTool> {
         .collect()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn run(program: &str, args: &[&str], text: &str) -> Result<(), String> {
     let status = std::process::Command::new(program)
         .args(args)
@@ -289,7 +434,7 @@ pub(crate) fn copy_to_clipboard(app: &AppHandle, text: &str) -> Result<(), Strin
 }
 
 // Clipboard, Ctrl+V, then the clipboard put back.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn paste_with(_app: &AppHandle, tool: &TypingTool, text: &str) -> Result<(), String> {
     with_clipboard(|clipboard| {
         let before = clipboard.get_text().ok();
@@ -310,7 +455,7 @@ fn paste_with(_app: &AppHandle, tool: &TypingTool, text: &str) -> Result<(), Str
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn installed(program: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))

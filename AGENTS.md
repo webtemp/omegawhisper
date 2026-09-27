@@ -4,7 +4,7 @@
 1. **UI**: shadcn/ui (the React version) with Tailwind CSS 4, generated into `src/components/ui/`. This is a React project — never shadcn-vue.
 
 ## What this is
-**Omegawhisper** — desktop speech-to-text, Tauri v2 + React 19, for macOS (Apple Silicon) and Linux. The Linux side is developed and tested on Arch with KDE Plasma 6 on Wayland and an AMD GPU.
+**Omegawhisper** — desktop speech-to-text, Tauri v2 + React 19, for macOS (Apple Silicon), Linux and Windows 11. The Linux side is developed and tested on Arch with KDE Plasma 6 on Wayland and an AMD GPU. There is no Windows machine: CI builds it and a tester runs it.
 
 **Local only.** Models (Whisper / Parakeet / Moonshine via `transcribe-rs`) run on this machine, buffer the whole recording, and transcribe once you stop. Nothing is sent anywhere. The hosted server and Deepgram were removed in 0.2.1.
 
@@ -57,10 +57,13 @@ F3 anywhere (macOS and X11: global key grab; Wayland: GlobalShortcuts portal;
 - `typing.rs` — putting text into other apps; `storage.rs` — the data folder and the log
 - `vad.rs` — is there speech in the recording (Silero VAD)
 - `linux.rs` — Linux only: the desktop file, the portal dictation key, the layer-shell indicator
+- `update.rs` — the startup check for a newer GitHub release, asked about with a dialog; called on Windows only until macOS is in the release
 - `models.rs` — the model list and download/delete; `tests.rs` — every test
 - `managers/model.rs` — `AVAILABLE_MODELS`, download, delete, disk status
 - `managers/transcription.rs` — loads a model, runs `transcribe-rs`
 - `resampler.rs` — resample the microphone's rate down to 16 kHz
+
+`src-tauri/tauri.windows.conf.json` — merged into `tauri.conf.json` on Windows builds only: `targets: nsis` and `createUpdaterArtifacts`, kept out of the main file so a Linux or macOS build needs no signing key. `.github/workflows/windows.yml` — check, clippy and tests on every push; a `v*` tag builds, signs and publishes the installer with `latest.json`.
 
 `src-tauri/icons/` — all committed, none generated. `icon.icns`/`icon.ico` and the sized PNGs are the app icon; `tray/` holds the menu-bar frames (`key-up`/`mid`/`down`, plus an unused `switch-*` set) as SVG source beside the 36x36 PNG that is compiled in. `TRAY_ICON` in `tray.rs` picks the set; `watch_tray_icon` plays the frames off the recording flag.
 
@@ -87,3 +90,10 @@ Read these in the code, not a copy here: `AudioState` at the top of `lib.rs`, `P
 - Sample rate comes from the input device, not hardcoded. 300 ms flush delay on `stop_recording`.
 - `get_platform` tells the settings page what differs: which system, whether the desktop holds the key, and what each GPU switch turns on. The page changes its wording from that rather than guessing.
 - Building on Linux without root: extract `webkit2gtk-4.1` (plus `enchant`, `libmanette`, `gtk-layer-shell`, `vulkan-headers`) into a prefix, point `PKG_CONFIG_PATH` at its `pkgconfig` dir with `prefix`/`libdir` rewritten, set `VULKAN_SDK` to the prefix, and run the result under `bwrap --overlay-src <prefix>/usr/lib --overlay-src /usr/lib --ro-overlay /usr/lib`, because WebKit spawns its helper processes from a compiled-in `/usr/lib/webkit2gtk-4.1` path.
+- Windows typing is `SendInput` with `KEYEVENTF_UNICODE`, no layout involved, in the same `utf16_chunks` pieces as macOS; `\n` goes as `VK_RETURN`. A refused chunk and everything after it is pasted through `arboard` and Ctrl+V. Enter is `VK_RETURN`. A target running as administrator drops both, and `SendInput` does not report it.
+- Windows log: `%LOCALAPPDATA%\omegawhisper\omegawhisper.log`. `SetStdHandle` turns Rust's output there (a release build has no console at all); the C runtime's stderr, which whisper.cpp prints through, is pointed there with `_dup2` via `libc`.
+- Windows tray: the frames are recoloured like on Linux, black or white from `SystemUsesLightTheme` in the registry, read at every frame change.
+- Windows GPU: Whisper on Vulkan (`whisper-vulkan` is a Linux-and-Windows dependency; CI installs the SDK). The ONNX models stay on the processor: DirectML would mean shipping its DLL, so `onnx_gpu` changes nothing there and `get_platform` says so.
+- Updater: `tauri-plugin-updater`, endpoint `releases/latest/download/latest.json` on GitHub, public key in `tauri.conf.json`. The private key is `~/.tauri/omegawhisper.key` (no password) and the repository secret `TAURI_SIGNING_PRIVATE_KEY`; it is never committed. `update.rs` checks on its own thread in release builds, asks with a dialog, and on Windows the installer exits the app, so the model is unloaded in `on_before_exit`.
+- Windows CI: LLVM comes with the runner (`LIBCLANG_PATH`), the Vulkan SDK from `jakoch/install-vulkan-sdk-action`, `bun run build` before `cargo check` because `generate_context!` embeds `dist`. `tauri-action` publishes the release.
+- `zbus` is a unix dependency; `transcribe toggle` on Windows only prints an error, and in a release build even that goes nowhere (`windows_subsystem`). The NSIS installer is per-user, WebView2 from the download bootstrapper when missing, no code signing yet.
