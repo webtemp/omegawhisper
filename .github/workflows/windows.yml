@@ -10,6 +10,10 @@ env:
   CARGO_TERM_COLOR: always
   # bindgen, for whisper.cpp's headers. LLVM ships on the runner image.
   LIBCLANG_PATH: C:\Program Files\LLVM\bin
+  # whisper.cpp builds its shader generator as a nested CMake project that
+  # finds the compiler through the environment, which the Visual Studio
+  # generator does not provide. Ninja inside the MSVC developer shell does.
+  CMAKE_GENERATOR: Ninja
 
 jobs:
   check:
@@ -17,6 +21,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -41,6 +46,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
