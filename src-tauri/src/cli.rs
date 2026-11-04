@@ -11,11 +11,12 @@
 use crate::live::Segmenter;
 use crate::managers::{EngineType, GpuChoice, ModelInfo, ModelManager, TranscriptionManager, AVAILABLE_MODELS};
 use crate::settings::{load_prefs, whisper_language, Prefs, LANGUAGES};
+use symphonia::core::io::MediaSource;
 use std::fs::{self, File};
 use std::io::{IsTerminal, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -739,6 +740,11 @@ fn squeeze(levels: &[f32], width: usize) -> Vec<f32> {
 
 // ---------------------------------------------------------------------------
 // Reading the audio.
+//
+// The file is read from disk a block at a time, and each block is turned into
+// one channel at 16 kHz before the next block is read. So the only copy of the
+// whole recording in memory is the 16 kHz one the models read: never the
+// file's bytes, and never the sound at the file's own rate.
 
 fn u16_at(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
@@ -748,88 +754,405 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
-/// The samples of a WAV file, all channels averaged into one, at the file's
-/// own rate. Reads RF64 too, and files whose data size was never filled in
-/// (a recording cut off before it was closed): their data runs to the end.
-pub(crate) fn read_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
-    let riff = bytes.len() >= 12 && (&bytes[0..4] == b"RIFF" || &bytes[0..4] == b"RF64");
-    if !riff || &bytes[8..12] != b"WAVE" {
-        return Err("not a WAV file".into());
+/// Where `read_audio` reads from.
+#[derive(Clone, Copy)]
+pub(crate) enum Source<'a> {
+    /// A file on disk.
+    File(&'a Path),
+    /// Bytes already in memory: the recordings built into the self-test.
+    Memory(&'a [u8]),
+}
+
+impl<'a> Source<'a> {
+    /// A reader at the start of the source. It keeps `position` set to how
+    /// far into the source it is, for the progress bar.
+    fn open(self, position: Arc<AtomicU64>) -> Result<Reader<'a>, String> {
+        let inner: Box<dyn MediaSource + 'a> = match self {
+            Source::File(path) => {
+                Box::new(File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?)
+            }
+            Source::Memory(bytes) => Box::new(std::io::Cursor::new(bytes)),
+        };
+        let len = inner.byte_len().unwrap_or(0);
+        position.store(0, Ordering::Relaxed);
+        Ok(Reader { inner, len, at: 0, position })
     }
-    let mut format = None;
-    let mut data = None;
-    // RF64 keeps the real data size in its ds64 block.
-    let mut size64: Option<usize> = None;
-    let mut pos = 12;
-    while pos + 8 <= bytes.len() {
-        let id = &bytes[pos..pos + 4];
-        let len = u32_at(bytes, pos + 4) as usize;
-        let start = pos + 8;
-        let end = start.saturating_add(len).min(bytes.len());
-        match id {
-            b"fmt " => {
-                if end - start < 16 {
-                    return Err("the WAV format block is too short".into());
-                }
-                let b = &bytes[start..end];
-                let mut code = u16_at(b, 0);
-                // WAVE_FORMAT_EXTENSIBLE keeps the real code in its sub-format.
-                if code == 0xFFFE && b.len() >= 26 {
-                    code = u16_at(b, 24);
-                }
-                format = Some((code, u16_at(b, 2), u32_at(b, 4), u16_at(b, 14)));
+}
+
+/// A source being read, and how far into it the reading is.
+struct Reader<'a> {
+    inner: Box<dyn MediaSource + 'a>,
+    /// The size of the source in bytes.
+    len: u64,
+    at: u64,
+    /// `at`, where the progress bar can see it while symphonia owns the reader.
+    position: Arc<AtomicU64>,
+}
+
+impl Reader<'_> {
+    fn moved_to(&mut self, at: u64) {
+        self.at = at;
+        self.position.store(at, Ordering::Relaxed);
+    }
+}
+
+impl std::io::Read for Reader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.moved_to(self.at + read as u64);
+        Ok(read)
+    }
+}
+
+impl std::io::Seek for Reader<'_> {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let at = self.inner.seek(to)?;
+        self.moved_to(at);
+        Ok(at)
+    }
+}
+
+impl MediaSource for Reader<'_> {
+    fn is_seekable(&self) -> bool {
+        self.inner.is_seekable()
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.len)
+    }
+}
+
+/// Tells the progress bar how much of the file has been read, from 0 to 1,
+/// each time that grows by a thousandth.
+struct ReadProgress<'p> {
+    position: Arc<AtomicU64>,
+    len: u64,
+    shown: u64,
+    report: &'p mut dyn FnMut(f32),
+}
+
+impl ReadProgress<'_> {
+    fn update(&mut self) {
+        let thousandths = self.position.load(Ordering::Relaxed).min(self.len) * 1000 / self.len.max(1);
+        if thousandths != self.shown {
+            self.shown = thousandths;
+            (self.report)(thousandths as f32 / 1000.0);
+        }
+    }
+
+    /// The whole file is read, whatever lies after the sound.
+    fn done(&mut self) {
+        if self.shown != 1000 {
+            self.shown = 1000;
+            (self.report)(1.0);
+        }
+    }
+}
+
+/// Turns one channel at any rate into 16 kHz as it arrives, a block at a
+/// time. When the rate changes partway through a file, each part is
+/// converted from its own rate.
+struct To16k {
+    out: Vec<f32>,
+    part: Option<RatePart>,
+}
+
+/// The part of the sound at one rate.
+struct RatePart {
+    rate: u32,
+    /// None at 16 kHz, where the samples are kept as they are.
+    resampler: Option<crate::resampler::AudioResampler>,
+    /// Samples taken in at `rate`.
+    taken: u64,
+    /// Where this part starts in the output.
+    start: usize,
+    /// Output samples still to throw away. The resampler hands its output
+    /// back late by a fixed amount; that much is cut from the front, so the
+    /// time marks match the file.
+    late: usize,
+}
+
+impl To16k {
+    fn new() -> Self {
+        Self { out: Vec::new(), part: None }
+    }
+
+    /// Makes room for `frames` more samples at `rate`, once converted, plus a
+    /// second, so the output is not moved to a bigger block of memory (and
+    /// for a moment held twice) while it grows.
+    fn reserve(&mut self, frames: u64, rate: u32) {
+        let wanted = frames.saturating_mul(RATE as u64) / rate.max(1) as u64 + RATE as u64;
+        let _ = self.out.try_reserve(usize::try_from(wanted).unwrap_or(usize::MAX));
+    }
+
+    fn push(&mut self, samples: &[f32], rate: u32) -> Result<(), String> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        if self.part.as_ref().map(|p| p.rate) != Some(rate) {
+            self.end_part()?;
+            let resampler = if rate as usize == RATE {
+                None
+            } else {
+                Some(crate::resampler::AudioResampler::new(rate)?)
+            };
+            let late = resampler.as_ref().map_or(0, |r| r.output_delay());
+            self.part = Some(RatePart { rate, resampler, taken: 0, start: self.out.len(), late });
+        }
+        let Some(part) = self.part.as_mut() else {
+            return Ok(());
+        };
+        part.taken += samples.len() as u64;
+        match part.resampler.as_mut() {
+            None => self.out.extend_from_slice(samples),
+            Some(resampler) => {
+                let converted = resampler.process(samples)?;
+                let skip = part.late.min(converted.len());
+                part.late -= skip;
+                self.out.extend_from_slice(&converted[skip..]);
             }
-            b"ds64" if end - start >= 16 => {
-                let b = &bytes[start..end];
-                size64 = Some(u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize);
-            }
-            b"data" => {
-                let real = match (len, size64) {
-                    (l, Some(big)) if l == u32::MAX as usize => start.saturating_add(big).min(bytes.len()),
-                    // Never filled in: the data runs to the end of the file.
-                    (0, _) => bytes.len(),
-                    (l, None) if l == u32::MAX as usize => bytes.len(),
-                    _ => end,
-                };
-                data = Some(&bytes[start..real]);
-                if real == bytes.len() {
+        }
+        Ok(())
+    }
+
+    /// The end of the part at the current rate: the rest of its sound is
+    /// taken out of the resampler, and the part is made exactly as long as
+    /// its input at 16 kHz.
+    fn end_part(&mut self) -> Result<(), String> {
+        let Some(mut part) = self.part.take() else {
+            return Ok(());
+        };
+        let end = part.start + (part.taken * RATE as u64 / part.rate as u64) as usize;
+        if let Some(resampler) = part.resampler.as_mut() {
+            // The resampler holds back up to one block of its input, and at
+            // some rates a block is long, so silence is pushed until all of
+            // it is out.
+            let silence = vec![0.0; part.rate as usize / 10];
+            for _ in 0..200 {
+                if self.out.len() >= end {
                     break;
                 }
+                let converted = resampler.process(&silence)?;
+                let skip = part.late.min(converted.len());
+                part.late -= skip;
+                self.out.extend_from_slice(&converted[skip..]);
             }
-            _ => {}
+            if self.out.len() < end {
+                return Err("the audio could not be converted to 16 kHz".into());
+            }
         }
-        if format.is_some() && data.is_some() {
-            break;
-        }
-        pos = start.saturating_add(len).saturating_add(len & 1);
-    }
-    let (code, channels, rate, bits) = format.ok_or("the WAV file has no format block")?;
-    let data = data.ok_or("the WAV file has no audio data")?;
-    if channels == 0 {
-        return Err("the WAV file says it has no channels".into());
-    }
-    if !(1_000..=768_000).contains(&rate) {
-        return Err(format!("the WAV file says its sample rate is {rate} Hz, which is not a real rate"));
+        self.out.truncate(end);
+        Ok(())
     }
 
-    let decode: fn(&[u8]) -> f32 = match (code, bits) {
-        (1, 8) => |c| (c[0] as f32 - 128.0) / 128.0,
-        (1, 16) => |c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0,
-        (1, 24) => |c| (i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8) as f32 / 8_388_608.0,
-        (1, 32) => |c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2_147_483_648.0,
-        (3, 32) => |c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
-        (3, 64) => |c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32,
-        _ => return Err(format!("this WAV encoding is not supported (format {code}, {bits} bits)")),
-    };
+    fn finish(mut self) -> Result<Vec<f32>, String> {
+        self.end_part()?;
+        Ok(self.out)
+    }
+}
 
-    // Straight to one channel, so a long stereo file is never held as stereo.
-    let width = bits as usize / 8;
-    let channels = channels as usize;
-    let mono = data
-        .chunks_exact(width * channels)
-        .map(|frame| frame.chunks_exact(width).map(decode).sum::<f32>() / channels as f32)
-        .collect();
-    Ok((mono, rate))
+/// Mono samples at `rate` Hz, all at once, at 16 kHz.
+fn to_16k(samples: &[f32], rate: u32) -> Result<Vec<f32>, String> {
+    let mut out = To16k::new();
+    out.push(samples, rate)?;
+    out.finish()
+}
+
+/// What a WAV file's header says: how its samples are stored, and where.
+/// Reads RF64 too, and files whose data size was never filled in (a
+/// recording cut off before it was closed): their data runs to the end.
+struct Wav {
+    /// One sample of one channel, from its bytes.
+    decode: fn(&[u8]) -> f32,
+    /// Bytes per sample of one channel.
+    width: usize,
+    channels: usize,
+    rate: u32,
+    /// Where the samples are in the file.
+    data: Range<u64>,
+}
+
+/// Bytes of a WAV file read at a time.
+const WAV_BLOCK: usize = 1 << 16;
+
+/// Whether the source starts like a WAV file. Leaves the reader at the start.
+fn is_wav<R: std::io::Read + std::io::Seek>(r: &mut R) -> Result<bool, String> {
+    r.seek(std::io::SeekFrom::Start(0)).map_err(read_error)?;
+    let mut head = [0u8; 12];
+    let wav = read_full(r, &mut head)? == head.len()
+        && (&head[0..4] == b"RIFF" || &head[0..4] == b"RF64")
+        && &head[8..12] == b"WAVE";
+    r.seek(std::io::SeekFrom::Start(0)).map_err(read_error)?;
+    Ok(wav)
+}
+
+fn read_error(e: std::io::Error) -> String {
+    format!("the file could not be read ({e})")
+}
+
+/// Fills `buf` as far as the source goes. Returns how much was read.
+fn read_full<R: std::io::Read>(r: &mut R, buf: &mut [u8]) -> Result<usize, String> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(read_error(e)),
+        }
+    }
+    Ok(filled)
+}
+
+impl Wav {
+    /// Reads the header: the blocks before the samples, and any after them
+    /// up to the format block.
+    fn read_header<R: std::io::Read + std::io::Seek>(r: &mut R) -> Result<Self, String> {
+        use std::io::SeekFrom;
+        let len = r.seek(SeekFrom::End(0)).map_err(read_error)?;
+        if !is_wav(r)? {
+            return Err("not a WAV file".into());
+        }
+        let mut format = None;
+        let mut data = None;
+        // RF64 keeps the real data size in its ds64 block.
+        let mut size64: Option<u64> = None;
+        let mut pos = 12u64;
+        while pos + 8 <= len {
+            let mut head = [0u8; 8];
+            r.seek(SeekFrom::Start(pos)).map_err(read_error)?;
+            if read_full(r, &mut head)? < head.len() {
+                break;
+            }
+            let id = &head[0..4];
+            let size = u32_at(&head, 4) as u64;
+            let start = pos + 8;
+            let end = start.saturating_add(size).min(len);
+            match id {
+                b"fmt " => {
+                    if end - start < 16 {
+                        return Err("the WAV format block is too short".into());
+                    }
+                    // The extensible format's sub-format ends at byte 26.
+                    let mut b = vec![0u8; (end - start).min(26) as usize];
+                    let read = read_full(r, &mut b)?;
+                    b.truncate(read);
+                    if b.len() < 16 {
+                        return Err("the WAV format block is too short".into());
+                    }
+                    let mut code = u16_at(&b, 0);
+                    // WAVE_FORMAT_EXTENSIBLE keeps the real code in its sub-format.
+                    if code == 0xFFFE && b.len() >= 26 {
+                        code = u16_at(&b, 24);
+                    }
+                    format = Some((code, u16_at(&b, 2), u32_at(&b, 4), u16_at(&b, 14)));
+                }
+                b"ds64" if end - start >= 16 => {
+                    let mut b = [0u8; 16];
+                    if read_full(r, &mut b)? == b.len() {
+                        size64 = Some(u64::from_le_bytes(b[8..16].try_into().unwrap()));
+                    }
+                }
+                b"data" => {
+                    let real = match (size, size64) {
+                        (l, Some(big)) if l == u32::MAX as u64 => start.saturating_add(big).min(len),
+                        // Never filled in: the data runs to the end of the file.
+                        (0, _) => len,
+                        (l, None) if l == u32::MAX as u64 => len,
+                        _ => end,
+                    };
+                    data = Some(start..real);
+                    if real == len {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if format.is_some() && data.is_some() {
+                break;
+            }
+            pos = start.saturating_add(size).saturating_add(size & 1);
+        }
+        let (code, channels, rate, bits) = format.ok_or("the WAV file has no format block")?;
+        let data = data.ok_or("the WAV file has no audio data")?;
+        if channels == 0 {
+            return Err("the WAV file says it has no channels".into());
+        }
+        if !(1_000..=768_000).contains(&rate) {
+            return Err(format!("the WAV file says its sample rate is {rate} Hz, which is not a real rate"));
+        }
+        let decode: fn(&[u8]) -> f32 = match (code, bits) {
+            (1, 8) => |c| (c[0] as f32 - 128.0) / 128.0,
+            (1, 16) => |c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0,
+            (1, 24) => |c| (i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8) as f32 / 8_388_608.0,
+            (1, 32) => |c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2_147_483_648.0,
+            (3, 32) => |c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+            (3, 64) => |c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32,
+            _ => return Err(format!("this WAV encoding is not supported (format {code}, {bits} bits)")),
+        };
+        Ok(Wav { decode, width: bits as usize / 8, channels: channels as usize, rate, data })
+    }
+
+    /// Whole frames (one sample of every channel) in the data.
+    fn frames(&self) -> u64 {
+        (self.data.end - self.data.start) / (self.width * self.channels) as u64
+    }
+
+    /// Reads the samples about `block` bytes at a time, and hands each block
+    /// to `take` as one channel, all channels averaged, at the file's rate.
+    /// Straight to one channel, so a long stereo file is never held as stereo.
+    fn read_samples<R: std::io::Read + std::io::Seek>(
+        &self,
+        r: &mut R,
+        block: usize,
+        take: &mut dyn FnMut(&[f32]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let frame = self.width * self.channels;
+        r.seek(std::io::SeekFrom::Start(self.data.start)).map_err(read_error)?;
+        let mut left = self.data.end - self.data.start;
+        let mut bytes = vec![0u8; block.max(frame)];
+        // Bytes in `bytes` not yet decoded: a frame split between two reads.
+        let mut filled = 0;
+        let mut mono = Vec::with_capacity(bytes.len() / frame);
+        while left > 0 {
+            let want = ((bytes.len() - filled) as u64).min(left) as usize;
+            let read = match r.read(&mut bytes[filled..filled + want]) {
+                // The file is shorter than its header says.
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(read_error(e)),
+            };
+            left -= read as u64;
+            filled += read;
+            let whole = filled / frame * frame;
+            mono.clear();
+            mono.extend(
+                bytes[..whole]
+                    .chunks_exact(frame)
+                    .map(|f| f.chunks_exact(self.width).map(self.decode).sum::<f32>() / self.channels as f32),
+            );
+            if !mono.is_empty() {
+                take(&mono)?;
+            }
+            bytes.copy_within(whole..filled, 0);
+            filled -= whole;
+        }
+        Ok(())
+    }
+}
+
+/// A whole WAV file in memory, as one channel at its own rate, and that
+/// rate. For the self-test; files are read with `read_audio`.
+fn read_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
+    let mut r = std::io::Cursor::new(bytes);
+    let wav = Wav::read_header(&mut r)?;
+    let mut mono = Vec::new();
+    wav.read_samples(&mut r, WAV_BLOCK, &mut |block| {
+        mono.extend_from_slice(block);
+        Ok(())
+    })?;
+    Ok((mono, wav.rate))
 }
 
 /// The file types `-f` reads, named in the errors.
@@ -838,26 +1161,63 @@ const SUPPORTED_TYPES: &str = "WAV, MP3, M4A (AAC or Apple Lossless), MP4 (its s
 /// What `read_audio` gives back.
 #[derive(Debug)]
 pub(crate) struct Decoded {
-    /// All channels averaged into one, at the file's own rate.
+    /// All channels averaged into one, at 16 kHz.
     pub(crate) samples: Vec<f32>,
-    pub(crate) rate: u32,
     /// Set when part of the file could not be read and was left out.
     pub(crate) warning: Option<String>,
 }
 
-/// The samples of an audio file. WAV goes to `read_wav`; every other type is
-/// read with symphonia. `name` is the file's name or path: its extension
-/// tells symphonia which format to try first.
-pub(crate) fn read_audio(bytes: &[u8], name: &str) -> Result<Decoded, String> {
-    let wav = bytes.len() >= 12 && (&bytes[0..4] == b"RIFF" || &bytes[0..4] == b"RF64") && &bytes[8..12] == b"WAVE";
-    if wav {
-        let (samples, rate) = read_wav(bytes)?;
-        return Ok(Decoded { samples, rate, warning: None });
+/// How the reading of a compressed file ended.
+#[derive(Default)]
+struct Ending {
+    /// Why the reading stopped before the end of the file, if it did.
+    stopped: Option<String>,
+    /// Packets that could not be decoded and were skipped.
+    damaged: usize,
+}
+
+impl Ending {
+    /// The warning for it, if any; `samples` is how much sound was kept, at 16 kHz.
+    fn warning(self, samples: usize) -> Option<String> {
+        match (self.stopped, self.damaged) {
+            (Some(why), _) => Some(format!(
+                "The file ends early or is damaged at {}: {why}. The text stops there.",
+                clock(samples as f32 / RATE as f32)
+            )),
+            (None, 1) => Some("1 damaged piece of the file was skipped.".into()),
+            (None, n) if n > 1 => Some(format!("{n} damaged pieces of the file were skipped.")),
+            _ => None,
+        }
     }
-    if bytes.is_empty() {
+}
+
+/// The sound of an audio file as one channel at 16 kHz. The file is read a
+/// block at a time: WAV here, every other type with symphonia. `name` is the
+/// file's name or path: its extension tells symphonia which format to try
+/// first. `progress` is told how much of the file has been read, from 0 to 1.
+pub(crate) fn read_audio(source: Source, name: &str, progress: &mut dyn FnMut(f32)) -> Result<Decoded, String> {
+    let position = Arc::new(AtomicU64::new(0));
+    let mut reader = source.open(position.clone())?;
+    let mut progress = ReadProgress { position, len: reader.len, shown: 0, report: progress };
+    let mut out = To16k::new();
+    let ending = if is_wav(&mut reader)? {
+        let wav = Wav::read_header(&mut reader)?;
+        out.reserve(wav.frames(), wav.rate);
+        wav.read_samples(&mut reader, WAV_BLOCK, &mut |mono| {
+            out.push(mono, wav.rate)?;
+            progress.update();
+            Ok(())
+        })?;
+        Ending::default()
+    } else if reader.len == 0 {
         return Err("the file is empty".into());
-    }
-    read_compressed(bytes, name)
+    } else {
+        read_compressed(source, reader, name, &mut out, &mut progress)?
+    };
+    progress.done();
+    let samples = out.finish()?;
+    let warning = ending.warning(samples.len());
+    Ok(Decoded { samples, warning })
 }
 
 /// A readable name for the codec of a sound track, for the error when it
@@ -926,31 +1286,67 @@ fn open_sound_track(
     })
 }
 
-/// Appends `samples`, at `from` Hz, to `out` at `to` Hz, by drawing a straight
-/// line between neighbouring samples. Only for the rare file whose sample rate
-/// changes partway through; the conversion to 16 kHz is done later by `to_16k`.
-fn append_at_rate(out: &mut Vec<f32>, samples: &[f32], from: u32, to: u32) {
-    let Some(&last) = samples.last() else {
-        return;
-    };
-    let count = (samples.len() as u64 * to as u64 / from as u64) as usize;
-    let step = from as f64 / to as f64;
-    out.extend((0..count).map(|i| {
-        let at = i as f64 * step;
-        let j = at as usize;
-        let a = samples.get(j).copied().unwrap_or(last);
-        let b = samples.get(j + 1).copied().unwrap_or(last);
-        a + (b - a) * (at - j as f64) as f32
-    }));
+/// Cuts what an encoder put before and after the sound. The first `start`
+/// samples are dropped as they arrive. The last `end` samples are held back
+/// until the end of the file shows whether they are padding to drop.
+struct EncoderGaps {
+    start: u64,
+    end: usize,
+    held: Vec<f32>,
+    held_rate: u32,
 }
 
-/// MP3, M4A, MP4, FLAC and OGG, read with symphonia. A panic inside symphonia
-/// ends only the reading of this file, with an error; its message is kept
-/// off the screen while the file is read.
-fn read_compressed(bytes: &[u8], name: &str) -> Result<Decoded, String> {
+impl EncoderGaps {
+    fn new(start: u64, end: usize) -> Self {
+        Self { start, end, held: Vec::new(), held_rate: 0 }
+    }
+
+    fn push(&mut self, samples: &[f32], rate: u32, out: &mut To16k) -> Result<(), String> {
+        let skip = self.start.min(samples.len() as u64) as usize;
+        self.start -= skip as u64;
+        let samples = &samples[skip..];
+        if self.end == 0 {
+            return out.push(samples, rate);
+        }
+        // At a change of rate, what is held is not the end of the file.
+        if rate != self.held_rate {
+            out.push(&self.held, self.held_rate)?;
+            self.held.clear();
+            self.held_rate = rate;
+        }
+        self.held.extend_from_slice(samples);
+        let over = self.held.len().saturating_sub(self.end);
+        out.push(&self.held[..over], rate)?;
+        self.held.drain(..over);
+        Ok(())
+    }
+
+    /// The end of the file: what is held goes out too, unless it is padding.
+    fn finish(self, padding: bool, out: &mut To16k) -> Result<(), String> {
+        if padding {
+            Ok(())
+        } else {
+            out.push(&self.held, self.held_rate)
+        }
+    }
+}
+
+/// MP3, M4A, MP4, FLAC and OGG, read with symphonia from `reader`, which is
+/// `source` opened. A panic inside symphonia ends only the reading of this
+/// file, with an error; its message is kept off the screen while the file is
+/// read.
+fn read_compressed(
+    source: Source,
+    reader: Reader,
+    name: &str,
+    out: &mut To16k,
+    progress: &mut ReadProgress,
+) -> Result<Ending, String> {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_compressed(bytes, name)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        decode_compressed(source, reader, name, out, progress)
+    }));
     std::panic::set_hook(hook);
     result.unwrap_or_else(|panic| {
         let why = panic
@@ -962,7 +1358,14 @@ fn read_compressed(bytes: &[u8], name: &str) -> Result<Decoded, String> {
     })
 }
 
-fn decode_compressed(bytes: &[u8], name: &str) -> Result<Decoded, String> {
+fn decode_compressed(
+    source: Source,
+    reader: Reader,
+    name: &str,
+    out: &mut To16k,
+    progress: &mut ReadProgress,
+) -> Result<Ending, String> {
+    use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_MP1, CODEC_ID_MP2, CODEC_ID_MP3};
     use symphonia::core::errors::Error;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::io::MediaSourceStream;
@@ -972,10 +1375,10 @@ fn decode_compressed(bytes: &[u8], name: &str) -> Result<Decoded, String> {
     if let Some(extension) = &extension {
         hint.with_extension(extension);
     }
-    // Reads straight from the bytes already in memory; nothing is copied.
-    let source = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
+    let file_len = reader.len;
+    let stream = MediaSourceStream::new(Box::new(reader), Default::default());
     let mut format = symphonia::default::get_probe()
-        .probe(&hint, source, Default::default(), Default::default())
+        .probe(&hint, stream, Default::default(), Default::default())
         .map_err(|e| match (e, extension.as_deref()) {
             (Error::LimitError(what), _) => format!("the file could not be read: it goes over a safety limit ({what})"),
             (_, Some(ext @ ("mp3" | "m4a" | "mp4" | "m4v" | "aac" | "flac" | "ogg" | "oga" | "mov"))) => format!(
@@ -987,7 +1390,18 @@ fn decode_compressed(bytes: &[u8], name: &str) -> Result<Decoded, String> {
     let (mut track_id, mut decoder) = open_sound_track(format.as_ref())?;
     let track = format.tracks().iter().find(|t| t.id == track_id);
     let params = track.and_then(|t| t.codec_params.as_ref()).and_then(|p| p.audio()).cloned();
-    let track_gaps = (track.and_then(|t| t.delay), track.and_then(|t| t.padding));
+    let (delay, padding) = (track.and_then(|t| t.delay), track.and_then(|t| t.padding));
+    // The length the file states, in frames at its own rate.
+    let mut stated = track.and_then(|t| t.num_frames);
+    // How long the track lasts, in ticks of its time base. Unlike `stated`,
+    // known also when the time base is not the sample rate.
+    let span = track.and_then(|t| Some((t.duration?.get(), t.time_base?)));
+    let aac = params.as_ref().is_some_and(|p| p.codec == CODEC_ID_AAC);
+    let mpeg = params.as_ref().is_some_and(|p| [CODEC_ID_MP1, CODEC_ID_MP2, CODEC_ID_MP3].contains(&p.codec));
+    let plain = params.as_ref().is_some_and(plain_aac);
+    // What an AAC file states about the silence its encoder put in front,
+    // read before any sound is decoded, since that silence comes first.
+    let aac_start = aac.then(|| (itunes_gapless(&mut *format), read_container(source)));
 
     // Room for the whole track up front when its length is known. The length
     // is only an estimate for some files (an MP3 without a header that
@@ -995,26 +1409,26 @@ fn decode_compressed(bytes: &[u8], name: &str) -> Result<Decoded, String> {
     // 2% and a second more are added. Capped at 16 samples per byte of file,
     // more than any real compressed file holds, so a wrong length in a
     // damaged header cannot ask for gigabytes.
-    let mut mono: Vec<f32> = Vec::new();
-    // The length the file states, in frames at its own rate.
-    let mut stated = track.and_then(|t| t.num_frames);
     if let Some(frames) = stated {
-        let second = params.as_ref().and_then(|p| p.sample_rate).unwrap_or(48_000) as u64;
-        let room = frames + frames / 50 + second;
-        let _ = mono.try_reserve(room.min(bytes.len() as u64 * 16) as usize);
+        let rate = params.as_ref().and_then(|p| p.sample_rate).unwrap_or(48_000);
+        let room = frames + frames / 50 + rate as u64;
+        out.reserve(room.min(file_len.saturating_mul(16)), rate);
     }
-    // The rate of `mono`: that of the first decoded packet.
-    let mut rate: Option<u32> = None;
-    // Audio at another rate than `mono`, kept apart until it is converted.
-    let mut other: Vec<f32> = Vec::new();
-    let mut other_rate = 0;
+
+    // The rate of the first decoded packet.
+    let mut first_rate: Option<u32> = None;
+    // Made at the first packet, when the rate the edit list needs is known.
+    let mut gaps: Option<EncoderGaps> = None;
+    // The decoded length at which the end held back by `gaps` is padding: the
+    // file is exactly as long as it says, so nothing was joined on after it.
+    let mut whole: Option<u64> = None;
     // One packet's samples, all channels side by side; reused for every packet.
     let mut interleaved: Vec<f32> = Vec::new();
-    let mut damaged = 0usize;
-    // Frames as the decoder handed them out, before any rate conversion.
+    // The same packet as one channel.
+    let mut mono: Vec<f32> = Vec::new();
+    // Frames as the decoder handed them out, before anything is cut.
     let mut decoded = 0u64;
-    // Why the reading stopped before the end of the file, if it did.
-    let mut stopped: Option<String> = None;
+    let mut ending = Ending::default();
 
     loop {
         let packet = match format.next_packet() {
@@ -1028,12 +1442,12 @@ fn decode_compressed(bytes: &[u8], name: &str) -> Result<Decoded, String> {
                 continue;
             }
             Err(e) => {
-                if mono.is_empty() && other.is_empty() {
+                if decoded == 0 {
                     return Err(format!("the file could not be read. It may be damaged or cut short ({e})"));
                 }
                 // Cut off or damaged after some sound was read: keep what
                 // was read, and say so.
-                stopped = Some(match e {
+                ending.stopped = Some(match e {
                     Error::IoError(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => "the file is cut off".into(),
                     e => e.to_string(),
                 });
@@ -1048,7 +1462,7 @@ fn decode_compressed(bytes: &[u8], name: &str) -> Result<Decoded, String> {
             // One damaged packet, or one using a feature the decoder lacks
             // (some rare parts of AAC): skip it and go on with the next.
             Err(Error::DecodeError(_) | Error::IoError(_) | Error::Unsupported(_)) => {
-                damaged += 1;
+                ending.damaged += 1;
                 continue;
             }
             Err(Error::ResetRequired) => {
@@ -1063,104 +1477,79 @@ fn decode_compressed(bytes: &[u8], name: &str) -> Result<Decoded, String> {
         // Channels and rate are read from every packet, as they may change
         // partway through a file.
         let channels = buffer.spec().channels().count().max(1);
-        let packet_rate = buffer.spec().rate();
-        if !(1_000..=768_000).contains(&packet_rate) {
-            return Err(format!("the file says its sample rate is {packet_rate} Hz, which is not a real rate"));
+        let rate = buffer.spec().rate();
+        if !(1_000..=768_000).contains(&rate) {
+            return Err(format!("the file says its sample rate is {rate} Hz, which is not a real rate"));
         }
         decoded += buffer.frames() as u64;
         buffer.copy_to_vec_interleaved(&mut interleaved);
-        let frames = interleaved.chunks_exact(channels).map(|frame| frame.iter().sum::<f32>() / channels as f32);
-        let to = *rate.get_or_insert(packet_rate);
-        if packet_rate == to {
-            append_at_rate(&mut mono, &other, other_rate, to);
-            other.clear();
-            mono.extend(frames);
-        } else {
-            if packet_rate != other_rate {
-                append_at_rate(&mut mono, &other, other_rate, to);
-                other.clear();
-                other_rate = packet_rate;
+        mono.clear();
+        mono.extend(interleaved.chunks_exact(channels).map(|frame| frame.iter().sum::<f32>() / channels as f32));
+        first_rate.get_or_insert(rate);
+        let gaps = gaps.get_or_insert_with(|| {
+            // An MP3 with a LAME header: cut the start delay it states, and
+            // the end padding when the file is exactly as long as it says.
+            if let (true, Some(delay)) = (mpeg, delay) {
+                let padding = padding.unwrap_or(0);
+                whole = stated.map(|frames| frames + delay as u64 + padding as u64);
+                return EncoderGaps::new(delay as u64, if whole.is_some() { padding as usize } else { 0 });
             }
-            other.extend(frames);
-        }
+            // AAC starts with silence the encoder put there; the decoder
+            // hands it out as sound. Cut it, so the time marks match the
+            // original.
+            if let Some((tags, container)) = &aac_start {
+                // At the rate the decoder hands out, which for HE-AAC
+                // decoded without its SBR part is half the stated rate.
+                let expected = span.and_then(|(ticks, base)| samples_at(ticks, base, rate)).or(stated);
+                let (start, length) = aac_priming(container, *tags, plain, expected, rate);
+                let end = length.zip(expected).and_then(|(length, all)| all.checked_sub(start.checked_add(length)?));
+                if let Some(end) = end {
+                    whole = expected;
+                    return EncoderGaps::new(start, end as usize);
+                }
+                return EncoderGaps::new(start, 0);
+            }
+            EncoderGaps::new(0, 0)
+        });
+        gaps.push(&mono, rate, out)?;
+        // Only from here: an MP4 file with its track list at the end is read
+        // to the end before the first packet, which is not progress.
+        progress.update();
     }
-    let rate = rate.unwrap_or(0);
-    append_at_rate(&mut mono, &other, other_rate, rate);
-    if mono.is_empty() {
-        return Err(if damaged > 0 {
-            format!("none of the sound in the file could be decoded ({damaged} damaged packets)")
+    if decoded == 0 {
+        return Err(if ending.damaged > 0 {
+            format!("none of the sound in the file could be decoded ({} damaged packets)", ending.damaged)
         } else {
             "the file holds no audio".into()
         });
     }
-
-    use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_MP1, CODEC_ID_MP2, CODEC_ID_MP3};
-    let aac = params.as_ref().is_some_and(|p| p.codec == CODEC_ID_AAC);
-    let mpeg = params.as_ref().is_some_and(|p| [CODEC_ID_MP1, CODEC_ID_MP2, CODEC_ID_MP3].contains(&p.codec));
-    // The start delay and end padding an MP3's LAME header states. With no
-    // such header the stated length is not trusted for the "cut short"
-    // check: for a header-less MP3 it is only a guess.
-    let (delay, padding) = track_gaps;
-    if mpeg && delay.is_none() {
-        stated = None;
+    if let Some(gaps) = gaps {
+        gaps.finish(whole == Some(decoded), out)?;
     }
-    let plain = params.as_ref().is_some_and(plain_aac);
 
     // The reader can also stop without an error at a cut: an MP3 cut in
     // half ends cleanly after its last whole frame. When the file states its
     // length, more than a second or 2% short of it is reported as a cut.
-    // Only an estimate for some MP3 files, hence the margin. Not for HE-AAC:
-    // decoded without its SBR part, it may come out at half the stated count.
-    if let (None, Some(stated)) = (&stopped, stated) {
+    // Only an estimate for some MP3 files, hence the margin. For an MP3
+    // without a LAME header (the header that counts its frames) the length
+    // is only a guess, and is not used at all. Not for HE-AAC: decoded
+    // without its SBR part, it may come out at half the stated count.
+    if mpeg && delay.is_none() {
+        stated = None;
+    }
+    if let (None, Some(stated), Some(rate)) = (&ending.stopped, stated, first_rate) {
         let margin = (rate as u64).max(stated / 50);
-        if decoded == mono.len() as u64 && decoded + margin < stated && (plain || !aac) {
-            stopped = Some(format!("the file says it holds {} of sound", clock(stated as f32 / rate as f32)));
+        if decoded + margin < stated && (plain || !aac) {
+            ending.stopped = Some(format!("the file says it holds {} of sound", clock(stated as f32 / rate as f32)));
         }
     }
-
-    // An MP3 with a LAME header: cut the start delay it states, and the end
-    // padding when the file is exactly as long as it says (so nothing was
-    // joined on after it).
-    if mpeg && decoded == mono.len() as u64 {
-        if let Some(delay) = delay {
-            if let Some(frames) = stated {
-                let padding = padding.unwrap_or(0) as u64;
-                if decoded == frames + delay as u64 + padding {
-                    mono.truncate((frames + delay as u64) as usize);
-                }
-            }
-            mono.drain(..(delay as usize).min(mono.len()));
-        }
-    }
-
-    // AAC starts with silence the encoder put there; the decoder hands it
-    // out as sound. Cut it, so the time marks match the original.
-    if aac && decoded == mono.len() as u64 {
-        let tags = itunes_gapless(&mut *format);
-        let (start, length) = aac_priming(bytes, tags, plain, decoded, rate);
-        mono.drain(..start.min(mono.len()));
-        if let Some(length) = length {
-            mono.truncate(length);
-        }
-    }
-
-    let seconds = mono.len() as f32 / rate as f32;
-    let warning = match (stopped, damaged) {
-        (Some(why), _) => Some(format!(
-            "The file ends early or is damaged at {}: {why}. The text stops there.",
-            clock(seconds)
-        )),
-        (None, 1) => Some("1 damaged piece of the file was skipped.".into()),
-        (None, n) if n > 1 => Some(format!("{n} damaged pieces of the file were skipped.")),
-        _ => None,
-    };
-    Ok(Decoded { samples: mono, rate, warning })
+    Ok(ending)
 }
 
 // The silence AAC-LC encoders put before the sound, in samples: 2112 from
 // Apple's encoders (afconvert, iTunes, Music) and from Nero and FDK. Used only
 // when the file does not state its own.
-const AAC_PRIMING: usize = 2112;
+const AAC_PRIMING: u64 = 2112;
 
 /// Whether the AAC track is plain AAC-LC. Its first 5 bits name the kind of
 /// AAC, 2 for plain, and a longer setup block means an extension (the SBR of
@@ -1192,40 +1581,115 @@ fn itunes_gapless(format: &mut dyn symphonia::core::formats::FormatReader) -> Op
     }
 }
 
-/// Samples to cut from the front of `decoded` AAC samples at `rate` Hz, and
-/// the length to keep if the file states it. In this order: the iTunSMPB tag
-/// when its numbers add up to what was decoded (at half the count for HE-AAC
-/// decoded without SBR); the edit list of an MP4 file; for plain AAC-LC in an
-/// MP4 file stating neither, the usual 2112. ADTS (.aac) files state nothing
-/// and nothing is cut.
+/// What the file around an AAC track says about the silence before it.
+#[derive(Debug, PartialEq)]
+enum Container {
+    /// Not an MP4 file: an ADTS (.aac) stream states nothing.
+    Other,
+    /// An MP4 file, and the seconds its edit list says to skip, if it has one.
+    Mp4 { edit_start: Option<f64> },
+}
+
+/// Samples a track lasting `ticks` of `base` holds at `rate` Hz, to the
+/// nearest sample.
+fn samples_at(ticks: u64, base: symphonia::core::units::TimeBase, rate: u32) -> Option<u64> {
+    let top = ticks as u128 * base.numer.get() as u128 * rate as u128;
+    let bottom = base.denom.get() as u128;
+    u64::try_from((top + bottom / 2) / bottom).ok()
+}
+
+/// Samples to cut from the front of AAC decoded at `rate` Hz, and the length
+/// to keep if the file states it. `expected` is how many samples the decoder
+/// should hand out, from the duration the file states. In this order: the
+/// iTunSMPB tag when its numbers add up to `expected`, or to twice it when
+/// the tag counts at the full rate of HE-AAC that is decoded here without
+/// its SBR part, at half the rate; the edit list of an MP4 file; for plain
+/// AAC-LC in an MP4 file stating neither, the usual 2112. ADTS (.aac) files
+/// state nothing and nothing is cut.
 fn aac_priming(
-    bytes: &[u8],
+    container: &Container,
     tags: Option<(u64, u64, u64)>,
     plain: bool,
-    decoded: u64,
+    expected: Option<u64>,
     rate: u32,
-) -> (usize, Option<usize>) {
-    if let Some((before, length, after)) = tags {
-        let total = before + length + after;
-        if total == decoded {
-            return (before as usize, Some(length as usize));
+) -> (u64, Option<u64>) {
+    if let (Some((before, length, after)), Some(expected)) = (tags, expected) {
+        let total = before.checked_add(length).and_then(|t| t.checked_add(after));
+        if total == Some(expected) {
+            return (before, Some(length));
         }
-        if total == decoded * 2 {
-            return ((before / 2) as usize, Some((length / 2) as usize));
+        if total == expected.checked_mul(2) {
+            return (before / 2, Some(length / 2));
         }
     }
-    let mp4 = bytes.len() >= 8 && &bytes[4..8] == b"ftyp";
-    if !mp4 {
-        return (0, None);
-    }
-    match mp4_edit_start(bytes) {
-        Some(seconds) => ((seconds * rate as f64).round() as usize, None),
-        None if plain => (AAC_PRIMING, None),
-        None => (0, None),
+    match container {
+        Container::Other => (0, None),
+        Container::Mp4 { edit_start: Some(seconds) } => ((seconds * rate as f64).round() as u64, None),
+        Container::Mp4 { edit_start: None } if plain => (AAC_PRIMING, None),
+        Container::Mp4 { edit_start: None } => (0, None),
     }
 }
 
-/// The boxes inside `data`, an MP4 box body or the whole file, as (name, body).
+// A moov box bigger than this is not read, and the file is treated as having
+// no edit list. The box describes the tracks: a few megabytes for a day of
+// sound.
+const MOOV_LIMIT: u64 = 64 << 20;
+
+/// Whether `source` is an MP4 file, and if so what its edit list says.
+fn read_container(source: Source) -> Container {
+    let Ok(mut r) = source.open(Arc::default()) else {
+        return Container::Other;
+    };
+    let mut head = [0u8; 8];
+    if !matches!(read_full(&mut r, &mut head), Ok(8)) || &head[4..8] != b"ftyp" {
+        return Container::Other;
+    }
+    let len = r.len;
+    Container::Mp4 { edit_start: read_moov(&mut r, len).and_then(|moov| mp4_edit_start(&moov)) }
+}
+
+/// The body of the file's moov box, the box that describes its tracks, found
+/// among the boxes at the top of the file.
+fn read_moov<R: std::io::Read + std::io::Seek>(r: &mut R, len: u64) -> Option<Vec<u8>> {
+    let mut at = 0u64;
+    loop {
+        r.seek(std::io::SeekFrom::Start(at)).ok()?;
+        let mut head = [0u8; 16];
+        let read = read_full(r, &mut head).ok()?;
+        if read < 8 {
+            return None;
+        }
+        let (size, header) = match u32::from_be_bytes(head[..4].try_into().ok()?) {
+            // The size is in the next 8 bytes.
+            1 if read == 16 => (u64::from_be_bytes(head[8..16].try_into().ok()?), 16),
+            1 => return None,
+            // The box runs to the end.
+            0 => (len - at, 8),
+            size => (size as u64, 8),
+        };
+        if size < header {
+            return None;
+        }
+        let end = at.checked_add(size)?.min(len);
+        if at + header > end {
+            return None;
+        }
+        if &head[4..8] == b"moov" {
+            let body = end - at - header;
+            if body > MOOV_LIMIT {
+                return None;
+            }
+            r.seek(std::io::SeekFrom::Start(at + header)).ok()?;
+            let mut moov = vec![0u8; body as usize];
+            let read = read_full(r, &mut moov).ok()?;
+            moov.truncate(read);
+            return Some(moov);
+        }
+        at = end;
+    }
+}
+
+/// The boxes inside `data`, an MP4 box body, as (name, body).
 fn mp4_boxes(data: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
     let mut at = 0usize;
     std::iter::from_fn(move || {
@@ -1252,11 +1716,10 @@ fn mp4_child<'a>(data: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     mp4_boxes(data).find(|(n, _)| *n == name).map(|(_, body)| body)
 }
 
-/// Seconds of the first sound track an MP4 file's edit list says to skip
-/// at the start: what the encoder put before the sound. None without an
-/// edit list.
-fn mp4_edit_start(bytes: &[u8]) -> Option<f64> {
-    let moov = mp4_child(bytes, b"moov")?;
+/// Seconds of the first sound track the edit list in `moov`, an MP4 file's
+/// moov box body, says to skip at the start: what the encoder put before
+/// the sound. None without an edit list.
+fn mp4_edit_start(moov: &[u8]) -> Option<f64> {
     let sound = mp4_boxes(moov).filter(|(n, _)| *n == b"trak").map(|(_, t)| t).find(|trak| {
         mp4_child(trak, b"mdia")
             .and_then(|mdia| mp4_child(mdia, b"hdlr"))
@@ -1282,40 +1745,6 @@ fn mp4_edit_start(bytes: &[u8]) -> Option<f64> {
         (time >= 0).then_some(time)
     })?;
     (timescale > 0).then(|| media_time as f64 / timescale as f64)
-}
-
-/// Down (or up) to the 16 kHz the models read, telling `progress` how far it got.
-fn to_16k(samples: &[f32], rate: u32, mut progress: impl FnMut(f32)) -> Result<Vec<f32>, String> {
-    if rate as usize == RATE {
-        return Ok(samples.to_vec());
-    }
-    let mut resampler = crate::resampler::AudioResampler::new(rate)?;
-    let wanted = samples.len() * RATE / rate as usize;
-    let mut out = Vec::with_capacity(wanted + RATE);
-    let step = rate as usize * 10;
-    for (i, chunk) in samples.chunks(step).enumerate() {
-        out.extend(resampler.process(chunk)?);
-        progress(((i + 1) * step).min(samples.len()) as f32 / samples.len().max(1) as f32);
-    }
-    // The resampler hands its output back late by a fixed amount. That much is
-    // cut from the front, and silence is pushed through to get the end out, so
-    // the time marks match the file.
-    // The resampler holds back up to one block of its input, and at some
-    // rates a block is long, so silence is pushed until all of it is out.
-    let delay = resampler.output_delay();
-    let silence = vec![0.0; rate as usize / 10];
-    for _ in 0..200 {
-        if out.len() >= wanted + delay {
-            break;
-        }
-        out.extend(resampler.process(&silence)?);
-    }
-    if out.len() < wanted + delay {
-        return Err("the audio could not be converted to 16 kHz".into());
-    }
-    let mut out = out.split_off(delay);
-    out.truncate(wanted);
-    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1915,19 +2344,19 @@ fn transcribe_pieces(
     })
 }
 
-// Read and convert the file, with progress on screen. The file's bytes are
-// let go as soon as they are read, so a long recording is not held twice.
-fn prepare_audio(bytes: Vec<u8>, name: &Path, ui: &Ui) -> Result<Vec<f32>, String> {
+// Read the file and convert it to 16 kHz, with progress on screen.
+fn prepare_audio(path: &Path, ui: &Ui) -> Result<Vec<f32>, String> {
     ui.status("Reading the audio", Some(0.0));
-    let Decoded { samples: raw, rate, warning } = read_audio(&bytes, &name.to_string_lossy())?;
-    drop(bytes);
+    let Decoded { samples, warning } = read_audio(Source::File(path), &path.to_string_lossy(), &mut |f| {
+        ui.status("Reading the audio", Some(f))
+    })?;
     if let Some(warning) = warning {
         ui.warn(&warning);
     }
-    if raw.is_empty() {
+    if samples.is_empty() {
         return Err("the file holds no audio".into());
     }
-    to_16k(&raw, rate, |f| ui.status("Reading the audio", Some(f)))
+    Ok(samples)
 }
 
 fn split_audio(samples: &[f32], pause_ms: u32, longest: f32, ui: &Ui) -> Vec<Range<usize>> {
@@ -2214,8 +2643,7 @@ fn run_job(
         *output = Some(open_output(path, &input, job.force)?);
     }
 
-    let bytes = fs::read(&input).map_err(|e| format!("cannot read {}: {e}", input.display()))?;
-    let samples = prepare_audio(bytes, &input, ui)?;
+    let samples = prepare_audio(&input, ui)?;
     let total = samples.len() as f32 / RATE as f32;
 
     let language_note = match (&language, model.engine_type) {
@@ -2384,8 +2812,7 @@ fn noise(samples: usize, amplitude: f32) -> Vec<f32> {
 }
 
 fn jfk_16k() -> Result<Vec<f32>, String> {
-    let (samples, rate) = read_wav(JFK)?;
-    to_16k(&samples, rate, |_| {})
+    Ok(read_audio(Source::Memory(JFK), "jfk.wav", &mut |_| {})?.samples)
 }
 
 type Check = Box<dyn FnOnce(&Ui) -> Result<String, String>>;
@@ -2426,7 +2853,7 @@ pub fn self_test(model: Option<String>, cpu: bool, visual: bool) -> i32 {
             if rate != 48_000 || mono.len() != tone.len() {
                 return Err(format!("read {} samples at {rate} Hz, wanted {} at 48000", mono.len(), tone.len()));
             }
-            let down = to_16k(&mono, rate, |_| {})?;
+            let down = to_16k(&mono, rate)?;
             // Whole cycles: each time the wave climbs from clearly below zero to
             // clearly above it. A plain sign change also counts the tiny
             // ripples near zero and reads too high.
@@ -2461,8 +2888,7 @@ pub fn self_test(model: Option<String>, cpu: bool, visual: bool) -> i32 {
             let wanted = loudness(&wav);
             let mut report = Vec::new();
             for (name, bytes) in [("MP3", JFK_MP3), ("M4A", JFK_M4A)] {
-                let sound = read_audio(bytes, &format!("jfk.{}", name.to_lowercase()))?;
-                let down = to_16k(&sound.samples, sound.rate, |_| {})?;
+                let down = read_audio(Source::Memory(bytes), &format!("jfk.{}", name.to_lowercase()), &mut |_| {})?.samples;
                 let off = (down.len() as f32 - wav.len() as f32) / RATE as f32;
                 if off.abs() > 0.02 {
                     return Err(format!("{name}: {:.2} s long, the WAV {:.2} s", down.len() as f32 / RATE as f32, wav.len() as f32 / RATE as f32));
@@ -2626,8 +3052,7 @@ pub fn self_test(model: Option<String>, cpu: bool, visual: bool) -> i32 {
             fs::write(&wav, crate::analysis::to_wav_bytes(&audio, RATE as u32, 1)).map_err(|e| e.to_string())?;
 
             let result = (|| {
-                let bytes = fs::read(&wav).map_err(|e| e.to_string())?;
-                let samples = prepare_audio(bytes, &wav, ui)?;
+                let samples = prepare_audio(&wav, ui)?;
                 let pieces = split_audio(&samples, 1200, longest_piece(model), ui);
                 let mut engine = load_engine(model, gpu, ui)?;
                 let pass = Pass {
@@ -2713,6 +3138,71 @@ mod tests {
         assert_eq!(word_match("", "ask"), 0.0);
     }
 
+    fn read(bytes: &[u8], name: &str) -> Result<Decoded, String> {
+        read_audio(Source::Memory(bytes), name, &mut |_| {})
+    }
+
+    // A WAV file put together by hand: its blocks, each padded to an even length.
+    fn chunk(id: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut c = [id, &(body.len() as u32).to_le_bytes()[..], body].concat();
+        if body.len() % 2 == 1 {
+            c.push(0);
+        }
+        c
+    }
+
+    fn fmt_body(code: u16, channels: u16, rate: u32, bits: u16) -> Vec<u8> {
+        let align = channels * bits / 8;
+        [
+            &code.to_le_bytes()[..],
+            &channels.to_le_bytes(),
+            &rate.to_le_bytes(),
+            &(rate * align as u32).to_le_bytes(),
+            &align.to_le_bytes(),
+            &bits.to_le_bytes(),
+        ]
+        .concat()
+    }
+
+    fn wav_file(riff: &[u8], chunks: &[Vec<u8>]) -> Vec<u8> {
+        let body = chunks.concat();
+        [riff, &((body.len() + 4) as u32).to_le_bytes()[..], b"WAVE", &body].concat()
+    }
+
+    /// Hands out at most `step` bytes per read, as a slow disk or a pipe may.
+    struct Trickle<'a> {
+        inner: std::io::Cursor<&'a [u8]>,
+        step: usize,
+    }
+
+    impl std::io::Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.step);
+            self.inner.read(&mut buf[..n])
+        }
+    }
+
+    impl std::io::Seek for Trickle<'_> {
+        fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    /// `bytes` read as a WAV file `step` bytes per read, in blocks of
+    /// `block` bytes: the samples, the rate, and how many blocks there were.
+    fn read_wav_in_blocks(bytes: &[u8], step: usize, block: usize) -> Result<(Vec<f32>, u32, usize), String> {
+        let mut r = Trickle { inner: std::io::Cursor::new(bytes), step };
+        let wav = Wav::read_header(&mut r)?;
+        let mut mono = Vec::new();
+        let mut blocks = 0;
+        wav.read_samples(&mut r, block, &mut |b| {
+            mono.extend_from_slice(b);
+            blocks += 1;
+            Ok(())
+        })?;
+        Ok((mono, wav.rate, blocks))
+    }
+
     #[test]
     fn a_wav_reads_back_as_written() {
         let samples = vec![0.0, 0.5, -0.5, 0.25];
@@ -2725,18 +3215,238 @@ mod tests {
     }
 
     #[test]
+    fn a_wav_reads_the_same_in_any_block_size() {
+        // 24-bit stereo, 6 bytes a frame, so most blocks end inside a frame;
+        // a list block of odd length before the data, and half a frame at the end.
+        let frames = 1000;
+        let mut data = Vec::new();
+        for i in 0..frames {
+            let left = (i * 4_001 % 16_000_000) as i32 - 8_000_000;
+            let right = -((i * 977 % 8_000_000) as i32);
+            data.extend_from_slice(&left.to_le_bytes()[..3]);
+            data.extend_from_slice(&right.to_le_bytes()[..3]);
+        }
+        data.extend_from_slice(&[1, 2, 3]);
+        let file = wav_file(
+            b"RIFF",
+            &[chunk(b"LIST", b"odd"), chunk(b"fmt ", &fmt_body(1, 2, 44_100, 24)), chunk(b"data", &data)],
+        );
+        let (whole, rate, _) = read_wav_in_blocks(&file, usize::MAX, WAV_BLOCK).unwrap();
+        assert_eq!(rate, 44_100);
+        assert_eq!(whole.len(), frames);
+        let at = |i: usize| ((i * 4_001 % 16_000_000) as f32 - 8_000_000.0 - (i * 977 % 8_000_000) as f32) / 2.0 / 8_388_608.0;
+        for i in [0, 1, 499, 999] {
+            assert!((whole[i] - at(i)).abs() < 1e-6, "frame {i}: {} against {}", whole[i], at(i));
+        }
+        for (step, block) in [(1, 1), (1, 6), (5, 7), (7, 13), (3, 4_099), (4_096, 4_096), (usize::MAX, 3_001)] {
+            let (blocked, _, blocks) = read_wav_in_blocks(&file, step, block).unwrap();
+            assert_eq!(blocked, whole, "{step} bytes a read, blocks of {block}");
+            assert!(blocks > 1, "{step} bytes a read, blocks of {block}");
+        }
+    }
+
+    #[test]
+    fn every_wav_encoding_reads() {
+        let tone = |n: usize| (0..n).map(|i| ((i as f32) * 0.37).sin() * 0.8).collect::<Vec<f32>>();
+        let samples = tone(777);
+        // Format code, bits, and how a sample is written in it.
+        type Encoding = (u16, u16, fn(f32) -> Vec<u8>);
+        let encodings: [Encoding; 6] = [
+            (1, 8, |x| vec![(x * 127.0 + 128.0) as u8]),
+            (1, 16, |x| ((x * 32767.0) as i16).to_le_bytes().to_vec()),
+            (1, 24, |x| ((x * 8_388_607.0) as i32).to_le_bytes()[..3].to_vec()),
+            (1, 32, |x| ((x * 2_147_483_647.0) as i32).to_le_bytes().to_vec()),
+            (3, 32, |x| x.to_le_bytes().to_vec()),
+            (3, 64, |x| (x as f64).to_le_bytes().to_vec()),
+        ];
+        for (code, bits, encode) in encodings {
+            let data: Vec<u8> = samples.iter().flat_map(|&x| encode(x)).collect();
+            // WAVE_FORMAT_EXTENSIBLE: the code moves to the sub-format at byte 24.
+            let mut extensible = fmt_body(0xFFFE, 1, 8_000, bits);
+            extensible.extend_from_slice(&[22, 0, bits as u8, 0, 4, 0, 0, 0]);
+            extensible.extend_from_slice(&code.to_le_bytes());
+            extensible.extend_from_slice(&[0; 14]);
+            for fmt in [fmt_body(code, 1, 8_000, bits), extensible] {
+                let file = wav_file(b"RIFF", &[chunk(b"fmt ", &fmt), chunk(b"data", &data)]);
+                let (mono, rate, _) = read_wav_in_blocks(&file, 3, 11).unwrap();
+                assert_eq!((mono.len(), rate), (samples.len(), 8_000), "format {code}, {bits} bits");
+                // 8 bits are only 256 steps.
+                let worst = mono.iter().zip(&samples).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+                let allowed = if bits == 8 { 0.02 } else { 1e-4 };
+                assert!(worst < allowed, "format {code}, {bits} bits: off by {worst}");
+            }
+        }
+    }
+
+    #[test]
+    fn rf64_and_unfinished_wavs_read() {
+        let data: Vec<u8> = (0..500i16).flat_map(|i| (i * 50).to_le_bytes()).collect();
+        let fmt = chunk(b"fmt ", &fmt_body(1, 1, 16_000, 16));
+        let after = chunk(b"LIST", b"after the data");
+        // RF64: the data block's size is u32::MAX and the real one is in ds64.
+        let ds64: Vec<u8> = [0u64.to_le_bytes(), (data.len() as u64).to_le_bytes(), 500u64.to_le_bytes()].concat();
+        let big = [&b"data"[..], &u32::MAX.to_le_bytes(), &data].concat();
+        let rf64 = wav_file(b"RF64", &[chunk(b"ds64", &[&ds64[..], &[0; 4]].concat()), fmt.clone(), big.clone(), after.clone()]);
+        // Never filled in: the data size is 0, or u32::MAX with no ds64, and
+        // the data runs to the end of the file.
+        let zero = wav_file(b"RIFF", &[fmt.clone(), [&b"data"[..], &0u32.to_le_bytes(), &data].concat()]);
+        let unknown = wav_file(b"RIFF", &[fmt.clone(), big]);
+        // The format block after the data.
+        let late_format = wav_file(b"RIFF", &[chunk(b"data", &data), fmt.clone()]);
+        for (name, file) in [("rf64", rf64), ("zero", zero), ("unknown", unknown), ("late format", late_format)] {
+            for (step, block) in [(usize::MAX, WAV_BLOCK), (7, 9)] {
+                let (mono, rate, _) = read_wav_in_blocks(&file, step, block).unwrap();
+                assert_eq!((mono.len(), rate), (500, 16_000), "{name}");
+                assert_eq!(mono[499], 499.0 * 50.0 / 32768.0, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn broken_wavs_are_errors() {
+        let fmt = |code, channels, rate, bits| chunk(b"fmt ", &fmt_body(code, channels, rate, bits));
+        let data = chunk(b"data", &[0; 64]);
+        let cases = [
+            (wav_file(b"RIFF", std::slice::from_ref(&data)), "no format block"),
+            (wav_file(b"RIFF", &[fmt(1, 1, 16_000, 16)]), "no audio data"),
+            (wav_file(b"RIFF", &[chunk(b"fmt ", &[1, 0, 1, 0]), data.clone()]), "too short"),
+            (wav_file(b"RIFF", &[fmt(1, 0, 16_000, 16), data.clone()]), "no channels"),
+            (wav_file(b"RIFF", &[fmt(1, 1, 50, 16), data.clone()]), "not a real rate"),
+            (wav_file(b"RIFF", &[fmt(2, 1, 16_000, 4), data.clone()]), "not supported"),
+        ];
+        for (file, wanted) in cases {
+            let err = read_wav(&file).unwrap_err();
+            assert!(err.contains(wanted), "{err}");
+            assert_eq!(read(&file, "x.wav").unwrap_err(), err);
+        }
+        assert_eq!(read_wav(b"RIFF").unwrap_err(), "not a WAV file");
+    }
+
+    /// The 16 kHz conversion done all at once: the whole input through the
+    /// resampler, its delay cut from the front, silence pushed to get the end out.
+    fn whole_file_16k(samples: &[f32], rate: u32) -> Vec<f32> {
+        let mut resampler = crate::resampler::AudioResampler::new(rate).unwrap();
+        let wanted = samples.len() * RATE / rate as usize;
+        let delay = resampler.output_delay();
+        let mut out = resampler.process(samples).unwrap();
+        let silence = vec![0.0; rate as usize / 10];
+        while out.len() < wanted + delay {
+            out.extend(resampler.process(&silence).unwrap());
+        }
+        out[delay..delay + wanted].to_vec()
+    }
+
+    fn blocks_16k(samples: &[f32], rate: u32, block: usize) -> Vec<f32> {
+        let mut out = To16k::new();
+        for b in samples.chunks(block) {
+            out.push(b, rate).unwrap();
+        }
+        out.finish().unwrap()
+    }
+
+    #[test]
+    fn converting_in_blocks_matches_converting_all_at_once() {
+        for rate in [8_000, 11_025, 22_050, 44_100, 48_000, 96_000] {
+            let mut sound = sine(1.3, 440.0, rate);
+            let hiss = noise(sound.len(), 0.1);
+            for (s, n) in sound.iter_mut().zip(hiss) {
+                *s += n;
+            }
+            let whole = whole_file_16k(&sound, rate);
+            assert_eq!(whole.len(), sound.len() * RATE / rate as usize);
+            for block in [1, 7, 441, 1_153, 100_000] {
+                assert_eq!(blocks_16k(&sound, rate, block), whole, "{rate} Hz in blocks of {block}");
+            }
+        }
+        // At 16 kHz nothing changes.
+        let sound = noise(12_345, 0.5);
+        assert_eq!(blocks_16k(&sound, 16_000, 1_000), sound);
+    }
+
+    #[test]
+    fn rate_changes_partway_are_converted() {
+        let parts = [(8_000, sine(1.0, 300.0, 8_000)), (48_000, sine(0.5, 300.0, 48_000)), (16_000, sine(0.25, 300.0, 16_000))];
+        let mut out = To16k::new();
+        for (rate, part) in &parts {
+            for b in part.chunks(1_000) {
+                out.push(b, *rate).unwrap();
+            }
+        }
+        let out = out.finish().unwrap();
+        // Each part converted from its own rate, as long as it lasts; the
+        // part at 16 kHz as it is.
+        let wanted: Vec<f32> = parts
+            .iter()
+            .flat_map(|(rate, part)| if *rate == 16_000 { part.clone() } else { whole_file_16k(part, *rate) })
+            .collect();
+        assert_eq!(out.len(), 16_000 + 8_000 + 4_000);
+        assert_eq!(out, wanted);
+    }
+
+    #[test]
+    fn encoder_gaps_are_cut_across_blocks() {
+        let sound: Vec<f32> = (0..20).map(|i| i as f32).collect();
+        for padding in [true, false] {
+            let mut out = To16k::new();
+            let mut gaps = EncoderGaps::new(5, 3);
+            for b in sound.chunks(4) {
+                gaps.push(b, 16_000, &mut out).unwrap();
+            }
+            gaps.finish(padding, &mut out).unwrap();
+            let wanted = if padding { &sound[5..17] } else { &sound[5..] };
+            assert_eq!(out.finish().unwrap(), wanted);
+        }
+        // At a change of rate what was held goes out: it was not the end.
+        let mut out = To16k::new();
+        let mut gaps = EncoderGaps::new(0, 3);
+        gaps.push(&[1.0; 10], 16_000, &mut out).unwrap();
+        gaps.push(&[2.0; 10], 16_000 * 2, &mut out).unwrap();
+        gaps.finish(true, &mut out).unwrap();
+        let out = out.finish().unwrap();
+        assert_eq!(out.len(), 10 + (10 - 3) / 2);
+        assert!(out[..10].iter().all(|&x| x == 1.0));
+    }
+
+    #[test]
+    fn reading_reports_its_progress() {
+        for (bytes, name) in [(JFK, "jfk.wav"), (JFK_MP3, "jfk.mp3"), (JFK_M4A, "jfk.m4a")] {
+            let mut seen = Vec::new();
+            read_audio(Source::Memory(bytes), name, &mut |f| seen.push(f)).unwrap();
+            assert!(seen.windows(2).all(|w| w[0] < w[1]), "{name}: {seen:?}");
+            assert_eq!(seen.last(), Some(&1.0), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_file_reads_the_same_as_its_bytes() {
+        let dir = std::env::temp_dir().join(format!("omegawhisper-read-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for (bytes, name) in [(JFK, "jfk.wav"), (JFK_MP3, "jfk.mp3"), (JFK_M4A, "jfk.m4a")] {
+            let path = dir.join(name);
+            fs::write(&path, bytes).unwrap();
+            let from_file = read_audio(Source::File(&path), name, &mut |_| {}).unwrap().samples;
+            assert_eq!(from_file, read(bytes, name).unwrap().samples, "{name}");
+        }
+        let empty = dir.join("empty.mp3");
+        fs::write(&empty, b"").unwrap();
+        assert_eq!(read_audio(Source::File(&empty), "empty.mp3", &mut |_| {}).unwrap_err(), "the file is empty");
+        let missing = dir.join("missing.mp3");
+        let err = read_audio(Source::File(&missing), "missing.mp3", &mut |_| {}).unwrap_err();
+        assert!(err.starts_with("cannot read"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn mp3_and_m4a_read_as_long_as_the_wav() {
-        let (wav, wav_rate) = read_wav(JFK).unwrap();
-        let wav_seconds = wav.len() as f32 / wav_rate as f32;
+        let wav = jfk_16k().unwrap();
         for (name, bytes) in [("jfk.mp3", JFK_MP3), ("jfk.m4a", JFK_M4A)] {
-            let Decoded { samples, rate, warning } = read_audio(bytes, name).unwrap();
-            assert_eq!(rate, wav_rate, "{name}");
+            let Decoded { samples, warning } = read(bytes, name).unwrap();
             assert!(warning.is_none(), "{name}: {warning:?}");
-            let seconds = samples.len() as f32 / rate as f32;
-            assert!((seconds - wav_seconds).abs() < 0.02, "{name}: {seconds} s against {wav_seconds} s");
+            let off = (samples.len() as f32 - wav.len() as f32) / RATE as f32;
+            assert!(off.abs() < 0.02, "{name}: {off} s longer than the WAV");
             assert!(samples.iter().all(|x| x.is_finite() && x.abs() <= 2.0), "{name}");
             // Read the same with no name to go by.
-            assert_eq!(read_audio(bytes, "").unwrap().samples.len(), samples.len(), "{name}");
+            assert_eq!(read(bytes, "").unwrap().samples.len(), samples.len(), "{name}");
         }
     }
 
@@ -2744,9 +3454,9 @@ mod tests {
     fn two_mp3_files_joined_are_read_to_the_end() {
         // The first file's header states its own length; the decoder must
         // not stop there and drop the second file.
-        let one = read_audio(JFK_MP3, "jfk.mp3").unwrap().samples.len();
+        let one = read(JFK_MP3, "jfk.mp3").unwrap().samples.len();
         let joined = [JFK_MP3, JFK_MP3].concat();
-        let Decoded { samples, warning, .. } = read_audio(&joined, "joined.mp3").unwrap();
+        let Decoded { samples, warning } = read(&joined, "joined.mp3").unwrap();
         assert!(warning.is_none(), "{warning:?}");
         assert!(samples.len() > one * 19 / 10, "{} samples against {one} for one file", samples.len());
     }
@@ -2762,12 +3472,11 @@ mod tests {
         let wav = &wav[..RATE * 3];
         let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
         for (name, bytes) in [("left.mp3", LEFT_MP3), ("left.m4a", LEFT_M4A)] {
-            let sound = read_audio(bytes, name).unwrap();
-            assert_eq!(sound.rate, 44_100, "{name}");
+            let sound = read(bytes, name).unwrap();
             assert!(sound.warning.is_none(), "{name}: {:?}", sound.warning);
-            let seconds = sound.samples.len() as f32 / 44_100.0;
+            let down = sound.samples;
+            let seconds = down.len() as f32 / RATE as f32;
             assert!((seconds - 3.0).abs() < 0.03, "{name}: {seconds} s");
-            let down = to_16k(&sound.samples, sound.rate, |_| {}).unwrap();
             // One channel holds the speech and the other silence, so the mix
             // is the speech at half its level.
             let ratio = rms(&down[RATE / 2..RATE * 5 / 2]) / rms(&wav[RATE / 2..RATE * 5 / 2]);
@@ -2789,12 +3498,25 @@ mod tests {
 
     #[test]
     fn aac_priming_comes_from_the_file() {
-        // An iTunSMPB tag whose numbers add up to what was decoded.
-        assert_eq!(aac_priming(&[], Some((2112, 176_000, 64)), true, 178_176, 16_000), (2112, Some(176_000)));
+        let tag = Some((2112, 176_000, 64));
+        // An iTunSMPB tag whose numbers add up to the length the file states.
+        assert_eq!(aac_priming(&Container::Other, tag, true, Some(178_176), 16_000), (2112, Some(176_000)));
         // The same at half the count: HE-AAC decoded without its SBR part.
-        assert_eq!(aac_priming(&[], Some((2112, 176_000, 64)), false, 89_088, 16_000), (1056, Some(88_000)));
+        assert_eq!(aac_priming(&Container::Other, tag, false, Some(89_088), 16_000), (1056, Some(88_000)));
+        // HE-AAC whose MP4 time base counts at the full 48 kHz, decoded here
+        // at 24 kHz: the decoder hands out half the stated ticks.
+        let full_rate = symphonia::core::units::TimeBase::from_recip(std::num::NonZero::new(48_000).unwrap());
+        assert_eq!(samples_at(356_352, full_rate, 24_000), Some(178_176));
+        assert_eq!(samples_at(3, full_rate, 16_000), Some(1));
+        // A tag whose numbers overflow is not used.
+        assert_eq!(aac_priming(&Container::Other, Some((u64::MAX, 2, 0)), true, Some(1), 16_000), (0, None));
+        // A tag that does not add up is not used.
+        let mp4 = Container::Mp4 { edit_start: None };
+        assert_eq!(aac_priming(&mp4, tag, true, Some(100_000), 16_000), (AAC_PRIMING, None));
+        assert_eq!(aac_priming(&mp4, tag, true, None, 16_000), (AAC_PRIMING, None));
         // Not an MP4 file and no tag: nothing is cut.
-        assert_eq!(aac_priming(b"ADTS data", None, true, 1000, 16_000), (0, None));
+        assert_eq!(aac_priming(&Container::Other, None, true, Some(1000), 16_000), (0, None));
+        assert_eq!(read_container(Source::Memory(b"ADTS data")), Container::Other);
         // An MP4 file whose sound track's edit list skips 1024 samples at
         // 16 kHz, after an empty edit; the HE-AAC track is decoded at 8 kHz.
         let mp4_box = |name: &[u8], body: &[u8]| [&(body.len() as u32 + 8).to_be_bytes()[..], name, body].concat();
@@ -2803,45 +3525,40 @@ mod tests {
         let entry = |time: i32| [&1000u32.to_be_bytes()[..], &time.to_be_bytes(), &[0, 1, 0, 0]].concat();
         let elst = mp4_box(b"elst", &[&[0u8; 4][..], &2u32.to_be_bytes(), &entry(-1), &entry(1024)].concat());
         let trak = mp4_box(b"trak", &[mp4_box(b"edts", &elst), mp4_box(b"mdia", &[mdhd, hdlr].concat())].concat());
-        let file = [mp4_box(b"ftyp", b"M4A \0\0\0\0"), mp4_box(b"moov", &trak)].concat();
-        assert_eq!(mp4_edit_start(&file), Some(1024.0 / 16_000.0));
-        assert_eq!(aac_priming(&file, None, false, 100_000, 8_000), (512, None));
+        let moov = mp4_box(b"moov", &trak);
+        let ftyp = mp4_box(b"ftyp", b"M4A \0\0\0\0");
+        let skip = Container::Mp4 { edit_start: Some(1024.0 / 16_000.0) };
+        assert_eq!(read_container(Source::Memory(&[ftyp.clone(), moov.clone()].concat())), skip);
+        assert_eq!(aac_priming(&skip, None, false, Some(100_000), 8_000), (512, None));
+        // The moov box after the sound, behind a box with a 64-bit size.
+        let mdat = [&1u32.to_be_bytes()[..], b"mdat", &1_016u64.to_be_bytes(), &[0; 1_000]].concat();
+        assert_eq!(read_container(Source::Memory(&[ftyp.clone(), mdat, moov].concat())), skip);
         // An MP4 file with no edit list: 2112 for plain AAC, nothing else.
-        assert_eq!(mp4_edit_start(JFK_M4A), None);
-        assert_eq!(aac_priming(JFK_M4A, None, true, 100_000, 16_000), (AAC_PRIMING, None));
-        assert_eq!(aac_priming(JFK_M4A, None, false, 100_000, 16_000), (0, None));
-        assert_eq!(mp4_edit_start(JFK_MP3), None);
+        assert_eq!(read_container(Source::Memory(JFK_M4A)), mp4);
+        assert_eq!(aac_priming(&mp4, None, true, Some(100_000), 16_000), (AAC_PRIMING, None));
+        assert_eq!(aac_priming(&mp4, None, false, Some(100_000), 16_000), (0, None));
+        assert_eq!(read_container(Source::Memory(JFK_MP3)), Container::Other);
     }
 
     #[test]
     fn damaged_and_empty_files_are_errors() {
-        assert!(read_audio(&[], "empty.mp3").is_err());
-        assert!(read_audio(&[], "empty.m4a").is_err());
+        assert!(read(&[], "empty.mp3").is_err());
+        assert!(read(&[], "empty.m4a").is_err());
         let garbage: Vec<u8> = noise(50_000, 1.0).iter().map(|x| (x * 127.0) as i8 as u8).collect();
-        assert!(read_audio(&garbage, "garbage.mp3").is_err());
-        assert!(read_audio(&garbage, "garbage.m4a").is_err());
-        assert!(read_audio(b"just some text, not sound", "notes.mp3").is_err());
-        let err = read_audio(b"just some text, not sound", "notes.txt").unwrap_err();
+        assert!(read(&garbage, "garbage.mp3").is_err());
+        assert!(read(&garbage, "garbage.m4a").is_err());
+        assert!(read(b"just some text, not sound", "notes.mp3").is_err());
+        let err = read(b"just some text, not sound", "notes.txt").unwrap_err();
         assert!(err.contains("not supported"), "{err}");
         // A file cut short is read up to the cut, or refused, and never panics.
         for bytes in [JFK_MP3, JFK_M4A] {
             for cut in [10, 100, 1_000, bytes.len() / 2] {
-                let _ = read_audio(&bytes[..cut], "cut.m4a");
-                let _ = read_audio(&bytes[..cut], "cut.mp3");
+                let _ = read(&bytes[..cut], "cut.m4a");
+                let _ = read(&bytes[..cut], "cut.mp3");
             }
         }
-        let half = read_audio(&JFK_MP3[..JFK_MP3.len() / 2], "half.mp3").unwrap();
+        let half = read(&JFK_MP3[..JFK_MP3.len() / 2], "half.mp3").unwrap();
         assert!(half.samples.len() > RATE * 4, "{} samples from half an MP3", half.samples.len());
-    }
-
-    #[test]
-    fn rate_changes_partway_are_converted() {
-        let mut out = Vec::new();
-        append_at_rate(&mut out, &[0.0, 1.0, 0.0, 1.0], 8_000, 16_000);
-        assert_eq!(out.len(), 8);
-        assert!((out[1] - 0.5).abs() < 1e-6);
-        append_at_rate(&mut out, &[], 8_000, 16_000);
-        assert_eq!(out.len(), 8);
     }
 
     #[test]
