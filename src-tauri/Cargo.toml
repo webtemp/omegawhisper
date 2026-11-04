@@ -43,6 +43,12 @@ tauri-plugin-updater = "2"
 # Only for dup2, to point the app's own output at its log file. On Windows the
 # C runtime's stderr, which whisper.cpp prints through, is pointed there too.
 libc = "0.2"
+# Reads MP3, M4A (AAC or Apple Lossless), the sound of an MP4 video, FLAC and
+# OGG Vorbis for the -f command, in Rust on every system, so no ffmpeg is
+# needed. WAV is read by our own code in cli.rs. The tag readers (all-meta)
+# let it step over an ID3 tag with cover art at the start of an MP3. opt-simd
+# makes its FFT use the processor's vector instructions; still all Rust.
+symphonia = { version = "0.6.1", default-features = false, features = ["mp3", "aac", "alac", "isomp4", "flac", "ogg", "vorbis", "all-meta", "opt-simd"] }
 # Note: silero-vad-rs has ort version conflict with transcribe-rs, using simple energy-based VAD instead
 
 [dependencies.async-trait]
@@ -83,6 +89,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Registry",
     "Win32_System_Console",
+    "Win32_System_Threading",
 ] }
 # The clipboard for the paste fallback, the same crate as on Linux.
 arboard = "3"

@@ -79,6 +79,9 @@ pub(crate) fn speech_seconds(samples: &[f32]) -> Result<f32, String> {
 pub(crate) struct Silero {
     vad: SileroVad,
     in_speech: bool,
+    // Where speech starts and where it ends, when not the app's own
+    // SPEECH_START and SPEECH_HOLD.
+    thresholds: Option<(f32, f32)>,
 }
 
 impl Silero {
@@ -88,14 +91,25 @@ impl Silero {
         Ok(Self {
             vad,
             in_speech: false,
+            thresholds: None,
         })
+    }
+
+    // Other thresholds than the app's. The command-line transcription uses
+    // lower ones: missing a word in a file loses it for good.
+    pub(crate) fn with_thresholds(mut self, start: f32, hold: f32) -> Self {
+        self.thresholds = Some((start, hold));
+        self
     }
 }
 
 impl crate::live::SpeechDetector for Silero {
     fn is_speech(&mut self, frame: &[f32]) -> bool {
         let probability = self.vad.speech_probability(frame).unwrap_or(0.0);
-        self.in_speech = crate::live::still_speech(self.in_speech, probability);
+        self.in_speech = match self.thresholds {
+            Some((start, hold)) => probability >= if self.in_speech { hold } else { start },
+            None => crate::live::still_speech(self.in_speech, probability),
+        };
         self.in_speech
     }
 }

@@ -37,22 +37,28 @@ impl AudioResampler {
 
         let mut output = Vec::new();
 
-        // Process complete chunks
-        while self.input_buffer.len() >= self.chunk_size {
-            let chunk: Vec<f32> = self.input_buffer.drain(..self.chunk_size).collect();
-            let input_frames = vec![chunk];
-
+        // Process complete chunks, then remove them from the buffer all at
+        // once: removing them one by one moves the rest of a long input
+        // along for every chunk.
+        let whole = self.input_buffer.len() / self.chunk_size * self.chunk_size;
+        for chunk in self.input_buffer[..whole].chunks_exact(self.chunk_size) {
             let resampled = self
                 .resampler
-                .process(&input_frames, None)
+                .process(&[chunk], None)
                 .map_err(|e| format!("Resampling failed: {}", e))?;
 
             if !resampled.is_empty() && !resampled[0].is_empty() {
                 output.extend_from_slice(&resampled[0]);
             }
         }
+        self.input_buffer.drain(..whole);
 
         Ok(output)
+    }
+
+    /// How many output samples late the resampler hands its output back.
+    pub fn output_delay(&self) -> usize {
+        self.resampler.output_delay()
     }
 
     /// Flush any remaining samples

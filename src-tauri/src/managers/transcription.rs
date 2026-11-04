@@ -80,7 +80,12 @@ pub fn style_prompt(language: Option<&str>) -> Option<String> {
 impl LoadedEngine {
     /// Transcribe audio samples (expects 16kHz mono f32 audio).
     /// Samples go straight to the engine - no temp WAV file needed.
-    fn transcribe(&mut self, samples: &[f32], language: Option<String>) -> Result<String, String> {
+    fn transcribe(
+        &mut self,
+        samples: &[f32],
+        language: Option<String>,
+        with_prompt: bool,
+    ) -> Result<String, String> {
         let result = match self {
             LoadedEngine::Whisper(engine) => {
                 // no_speech_thold is whisper.cpp's own default of 0.6, not the
@@ -90,7 +95,7 @@ impl LoadedEngine {
                 // loses most windows, which is why a long dictation came back
                 // as only its last few sentences, or as nothing at all.
                 let params = WhisperInferenceParams {
-                    initial_prompt: style_prompt(language.as_deref()),
+                    initial_prompt: style_prompt(language.as_deref()).filter(|_| with_prompt),
                     language,
                     no_speech_thold: 0.6,
                     ..Default::default()
@@ -255,7 +260,19 @@ impl TranscriptionManager {
     ) -> Result<String, String> {
         let engine = self.loaded_engine.as_mut().ok_or("No model loaded")?;
 
-        engine.transcribe(samples, language)
+        engine.transcribe(samples, language, true)
+    }
+
+    /// The same without Whisper's style prompt. The command-line transcription
+    /// uses it for a short piece: given only "Yes.", Whisper goes on with the
+    /// prompt's own last sentence and writes "Yes, exactly like that."
+    pub fn transcribe_without_prompt(
+        &mut self,
+        samples: &[f32],
+        language: Option<String>,
+    ) -> Result<String, String> {
+        let engine = self.loaded_engine.as_mut().ok_or("No model loaded")?;
+        engine.transcribe(samples, language, false)
     }
 }
 

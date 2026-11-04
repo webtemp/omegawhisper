@@ -45,7 +45,7 @@ const TAIL_FRAMES: usize = 10;
 pub(crate) const STOP_FLOOR_SECONDS: f32 = 2.0;
 // Below this the running peak is not trusted: the detector would be fed
 // amplified noise before the first word.
-const PEAK_FLOOR: f32 = 0.03;
+pub(crate) const PEAK_FLOOR: f32 = 0.03;
 
 pub(crate) struct Segmenter<D: SpeechDetector> {
     detector: D,
@@ -64,6 +64,20 @@ pub(crate) struct Segmenter<D: SpeechDetector> {
     longest_pause: usize,
     peak: f32,
     pause_frames: usize,
+    // Samples removed from the front of pending so far: where pending starts
+    // in the whole recording.
+    dropped: usize,
+    // Where each sentence handed out by the last `feed` started.
+    starts: Vec<usize>,
+    // Hand out sentences with under MIN_SPEECH_SECONDS of speech too, instead
+    // of dropping them. Off for dictation, where they are mostly noise. On for
+    // transcribing a file, where they are often a short "yes" or "ask not".
+    keep_short: bool,
+    // White noise added to the copy the detector sees, as a share of full
+    // scale. 0 for dictation. See `with_noise_floor`.
+    noise_floor: f32,
+    // The state of the number generator that makes that noise.
+    noise_state: u32,
 }
 
 impl<D: SpeechDetector> Segmenter<D> {
@@ -79,19 +93,31 @@ impl<D: SpeechDetector> Segmenter<D> {
             longest_pause: 0,
             peak: 0.0,
             pause_frames: (pause_ms as usize * 16_000 / 1000).div_ceil(FRAME).max(1),
+            dropped: 0,
+            starts: Vec::new(),
+            keep_short: false,
+            noise_floor: 0.0,
+            noise_state: 1,
         }
     }
 
     // Take in 16 kHz audio. Returns every sentence finished by it, in order.
     pub(crate) fn feed(&mut self, samples: &[f32]) -> Vec<Vec<f32>> {
         let mut sentences = Vec::new();
+        self.starts.clear();
         self.partial.extend_from_slice(samples);
         let whole = self.partial.len() / FRAME * FRAME;
         let frames: Vec<f32> = self.partial.drain(..whole).collect();
         for frame in frames.as_chunks::<FRAME>().0 {
             self.peak = self.peak.max(frame.iter().fold(0.0f32, |m, s| m.max(s.abs())));
             let gain = NORMALIZED_PEAK / self.peak.max(PEAK_FLOOR);
-            let scaled: Vec<f32> = frame.iter().map(|s| s * gain).collect();
+            let mut scaled: Vec<f32> = frame.iter().map(|s| s * gain).collect();
+            if self.noise_floor > 0.0 {
+                for s in &mut scaled {
+                    self.noise_state = self.noise_state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *s += (self.noise_state as f32 / u32::MAX as f32 * 2.0 - 1.0) * self.noise_floor;
+                }
+            }
             let speech = self.detector.is_speech(&scaled);
             self.pending.extend_from_slice(frame);
             if speech {
@@ -123,6 +149,7 @@ impl<D: SpeechDetector> Segmenter<D> {
         if self.pending.len() > keep {
             let extra = self.pending.len() - keep;
             self.pending.drain(..extra);
+            self.dropped += extra;
         }
         self.trailing = self.trailing.min(LEAD_IN_FRAMES);
     }
@@ -133,21 +160,55 @@ impl<D: SpeechDetector> Segmenter<D> {
         let drop = self.trailing.saturating_sub(TAIL_FRAMES) * FRAME;
         let end = self.pending.len().saturating_sub(drop);
         let sentence: Vec<f32> = self.pending.drain(..end).collect();
-        let long_enough = seconds_of(self.speech_frames) >= MIN_SPEECH_SECONDS;
+        let start = self.dropped;
+        self.dropped += end;
+        let long_enough = seconds_of(self.speech_frames) >= MIN_SPEECH_SECONDS
+            || (self.keep_short && self.speech_frames > 0);
         self.speech_frames = 0;
         self.trailing = self.pending.len() / FRAME;
         self.keep_lead_in();
+        if long_enough {
+            self.starts.push(start);
+        }
         long_enough.then_some(sentence)
     }
 
     // The recording is over: whatever was said since the last cut.
     pub(crate) fn finish(mut self) -> Option<Vec<f32>> {
         self.pending.append(&mut self.partial);
-        (seconds_of(self.speech_frames) >= MIN_SPEECH_SECONDS).then_some(self.pending)
+        let long_enough = seconds_of(self.speech_frames) >= MIN_SPEECH_SECONDS
+            || (self.keep_short && self.speech_frames > 0);
+        long_enough.then_some(self.pending)
     }
 
     pub(crate) fn silence_seconds(&self) -> f32 {
         seconds_of(self.silence_run)
+    }
+
+    pub(crate) fn keeping_short_sentences(mut self) -> Self {
+        self.keep_short = true;
+        self
+    }
+
+    // Add white noise at `amplitude` (a share of full scale) to every frame
+    // the detector sees. The detector scores speech much lower when the rest
+    // of the sound is close to digital zero: the silences of a decoded MP3,
+    // or everything above 4 kHz in audio recorded at 8 kHz. A microphone
+    // always has noise of its own, so dictation does not need this; files do.
+    pub(crate) fn with_noise_floor(mut self, amplitude: f32) -> Self {
+        self.noise_floor = amplitude;
+        self
+    }
+
+    // Where each sentence from the last `feed` starts in the whole recording,
+    // in samples. The command-line transcription cuts its pieces by these.
+    pub(crate) fn sentence_starts(&self) -> &[usize] {
+        &self.starts
+    }
+
+    // Where the audio `finish` would hand out starts.
+    pub(crate) fn pending_start(&self) -> usize {
+        self.dropped
     }
 
     pub(crate) fn heard_speech(&self) -> bool {
