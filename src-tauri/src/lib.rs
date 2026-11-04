@@ -1,4 +1,5 @@
 mod analysis;
+pub mod cli;
 mod chime;
 mod history;
 mod indicator;

@@ -55,6 +55,11 @@ impl AudioResampler {
         Ok(output)
     }
 
+    /// How many output samples late the resampler hands its output back.
+    pub fn output_delay(&self) -> usize {
+        self.resampler.output_delay()
+    }
+
     /// Flush any remaining samples
     pub fn flush(&mut self) -> Result<Vec<f32>, String> {
         if self.input_buffer.is_empty() {
